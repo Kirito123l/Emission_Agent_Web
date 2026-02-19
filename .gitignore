@@ -1,0 +1,14 @@
+.env
+__pycache__/
+**/__pycache__/
+*.pyc
+*.pyo
+.env.*
+!.env.example
+data/sessions/
+logs/
+outputs/
+*.png
+*.jpg
+*.jpeg
+.DS_Store

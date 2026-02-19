@@ -1,0 +1,15 @@
+__pycache__/
+**/__pycache__/
+*.pyc
+*.pyo
+.env
+node_modules/
+*.png
+*.jpg
+*.jpeg
+.git/
+.claude/
+*.log
+outputs/
+logs/
+data/sessions/history/
