@@ -1,0 +1,190 @@
+"""
+Context Assembler - Assembles context for LLM
+No decision-making, just information assembly
+"""
+import logging
+from typing import Dict, List, Optional
+from dataclasses import dataclass
+from services.config_loader import ConfigLoader
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class AssembledContext:
+    """Assembled context ready for LLM"""
+    system_prompt: str
+    tools: List[Dict]
+    messages: List[Dict]
+    estimated_tokens: int
+
+
+class ContextAssembler:
+    """
+    Context assembler - Assembles all information for LLM
+
+    Design: No decisions, just assembly
+    Priority: Core prompt > Tools > Facts > Working memory > File context
+    """
+
+    MAX_CONTEXT_TOKENS = 6000  # Conservative limit
+
+    def __init__(self):
+        self.config = ConfigLoader.load_prompts()
+        self.tools = ConfigLoader.load_tool_definitions()
+
+    def assemble(
+        self,
+        user_message: str,
+        working_memory: List[Dict],
+        fact_memory: Dict,
+        file_context: Optional[Dict] = None
+    ) -> AssembledContext:
+        """
+        Assemble complete context for LLM
+
+        Token budget priority:
+        1. Core prompt (~200 tokens) - MUST
+        2. Tool definitions (~400 tokens) - MUST
+        3. Fact memory (~100 tokens) - Important
+        4. Working memory (~3000 tokens) - Important
+        5. File context (~500 tokens) - Optional
+
+        Args:
+            user_message: Current user message
+            working_memory: Recent conversation turns
+            fact_memory: Structured facts
+            file_context: Optional file information
+
+        Returns:
+            AssembledContext ready for LLM
+        """
+        used_tokens = 0
+
+        # 1. Core prompt (MUST)
+        system_prompt = self.config["system_prompt"]
+        used_tokens += self._estimate_tokens(system_prompt)
+
+        # 2. Tool definitions (MUST)
+        tools = self.tools
+        used_tokens += 400  # Estimated
+
+        # 3. Build messages
+        messages = []
+
+        # 3.1 Add fact memory if available
+        if fact_memory and any(fact_memory.values()):
+            fact_summary = self._format_fact_memory(fact_memory)
+            if fact_summary:
+                messages.append({
+                    "role": "system",
+                    "content": f"[Context from previous conversations]\n{fact_summary}"
+                })
+                used_tokens += self._estimate_tokens(fact_summary)
+
+        # 3.2 Add working memory (recent conversations)
+        remaining_budget = self.MAX_CONTEXT_TOKENS - used_tokens - 500
+        working_memory_messages = self._format_working_memory(
+            working_memory,
+            max_tokens=remaining_budget
+        )
+        messages.extend(working_memory_messages)
+        used_tokens += self._estimate_tokens(str(working_memory_messages))
+
+        # 3.3 Add file context if available
+        if file_context:
+            file_summary = self._format_file_context(file_context, max_tokens=500)
+            user_message = f"[File uploaded]\n{file_summary}\n\n[User message]\n{user_message}"
+
+        # 3.4 Add current user message
+        messages.append({"role": "user", "content": user_message})
+        used_tokens += self._estimate_tokens(user_message)
+
+        logger.info(f"Assembled context: ~{used_tokens} tokens, {len(messages)} messages")
+
+        return AssembledContext(
+            system_prompt=system_prompt,
+            tools=tools,
+            messages=messages,
+            estimated_tokens=used_tokens
+        )
+
+    def _format_fact_memory(self, fact_memory: Dict) -> str:
+        """Format fact memory for LLM"""
+        lines = []
+
+        if fact_memory.get("recent_vehicle"):
+            lines.append(f"Recent vehicle type: {fact_memory['recent_vehicle']}")
+
+        if fact_memory.get("recent_pollutants"):
+            pols = ", ".join(fact_memory["recent_pollutants"])
+            lines.append(f"Recent pollutants: {pols}")
+
+        if fact_memory.get("recent_year"):
+            lines.append(f"Recent model year: {fact_memory['recent_year']}")
+
+        if fact_memory.get("active_file"):
+            lines.append(f"Active file: {fact_memory['active_file']}")
+
+        return "\n".join(lines) if lines else ""
+
+    def _format_working_memory(
+        self,
+        working_memory: List[Dict],
+        max_tokens: int
+    ) -> List[Dict]:
+        """
+        Format working memory for LLM
+
+        Strategy: Keep last 3 complete turns
+        If over budget, keep last 2 turns
+        """
+        if not working_memory:
+            return []
+
+        # Keep last 3 turns
+        recent = working_memory[-3:]
+
+        result = []
+        for turn in recent:
+            result.append({"role": "user", "content": turn["user"]})
+            result.append({"role": "assistant", "content": turn["assistant"]})
+
+        # Simple token check
+        estimated = self._estimate_tokens(str(result))
+        if estimated > max_tokens and len(recent) > 2:
+            # Drop oldest turn
+            recent = working_memory[-2:]
+            result = []
+            for turn in recent:
+                result.append({"role": "user", "content": turn["user"]})
+                result.append({"role": "assistant", "content": turn["assistant"]})
+
+        return result
+
+    def _format_file_context(self, file_context: Dict, max_tokens: int) -> str:
+        """Format file context for LLM"""
+        lines = [
+            f"Filename: {file_context.get('filename', 'unknown')}",
+            f"File path: {file_context.get('file_path', 'unknown')}",  # Add file path!
+            f"Type: {file_context.get('detected_type', 'unknown')}",
+            f"Rows: {file_context.get('row_count', 'unknown')}",
+            f"Columns: {', '.join(file_context.get('columns', []))}",
+        ]
+
+        # Add sample data if space available
+        if max_tokens > 300 and file_context.get("sample_rows"):
+            lines.append(f"Sample (first 2 rows): {file_context['sample_rows'][:2]}")
+
+        return "\n".join(lines)
+
+    def _estimate_tokens(self, text: str) -> int:
+        """
+        Estimate token count
+
+        Simple heuristic: 1 Chinese char ≈ 1 token, 1 English word ≈ 1 token
+        In production, use tiktoken for accurate counting
+        """
+        if not text:
+            return 0
+        return len(text) // 2
