@@ -1,16 +1,20 @@
-FROM python:3.11-slim
+# ---- builder stage: compile native extensions ----
+FROM python:3.11-slim AS builder
 
-WORKDIR /app
-
-# System dependencies for faiss-cpu and pandas
 RUN apt-get update && \
     apt-get install -y --no-install-recommends gcc g++ && \
     rm -rf /var/lib/apt/lists/*
 
-# Install Python dependencies
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt && \
-    pip install --no-cache-dir FlagEmbedding || true
+RUN pip install --no-cache-dir --prefix=/install -r requirements.txt
+
+# ---- runtime stage: slim image without compilers ----
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# Copy only the installed packages from builder
+COPY --from=builder /install /usr/local
 
 # Copy application code
 COPY . .
