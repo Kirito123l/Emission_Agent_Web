@@ -56,7 +56,10 @@ class KnowledgeRetriever:
 
         # API模式下设置dashscope
         if self.embedding_mode == "api" and DASHSCOPE_AVAILABLE:
-            dashscope.api_key = self.config.providers["qwen"]["api_key"]
+            api_key = self.config.providers["qwen"]["api_key"]
+            if not api_key:
+                logger.error("QWEN_API_KEY not set, API embedding will fail")
+            dashscope.api_key = api_key
 
     def load(self) -> bool:
         """加载索引"""
