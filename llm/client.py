@@ -24,6 +24,11 @@ class LLMClient:
         self.client = self._client_proxy or self._client_direct
 
     def _create_client(self, use_proxy: bool) -> OpenAI:
+        if not self._api_key:
+            raise ValueError(
+                "LLM API key not configured. "
+                "Please set QWEN_API_KEY environment variable."
+            )
         http_client = None
         if use_proxy and self._proxy:
             http_client = httpx.Client(proxy=self._proxy, timeout=self._timeout)

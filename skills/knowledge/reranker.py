@@ -27,6 +27,12 @@ class KnowledgeReranker:
     def _create_api_client(self) -> OpenAI:
         """创建API客户端（用于在线rerank）"""
         provider = self.config.providers["qwen"]
+        api_key = provider["api_key"]
+        if not api_key:
+            raise ValueError(
+                "Rerank API key not configured. "
+                "Please set QWEN_API_KEY environment variable."
+            )
         proxy = self.config.https_proxy or self.config.http_proxy
 
         http_client = None
@@ -35,7 +41,7 @@ class KnowledgeReranker:
             logger.info(f"Rerank API使用代理: {proxy}")
 
         return OpenAI(
-            api_key=provider["api_key"],
+            api_key=api_key,
             base_url=provider["base_url"],
             http_client=http_client
         )
