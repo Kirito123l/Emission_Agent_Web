@@ -1,5 +1,5 @@
 // ==================== API配置 ====================
-const API_BASE = 'http://localhost:8000/api';
+const API_BASE = '/api';
 let currentSessionId = null;
 let currentFile = null;
 const USE_STREAMING = true;  // 是否使用流式输出
