@@ -8,14 +8,7 @@ TOOL_DEFINITIONS = [
         "type": "function",
         "function": {
             "name": "query_emission_factors",
-            "description": """Query vehicle emission factor curves.
-
-Use this when:
-- User wants to know emission factors for a vehicle type
-- User asks about emission characteristics at different speeds
-- User wants to compare emissions at different speeds
-
-Output: Speed-emission factor relationship chart + key data points table""",
+            "description": "Query vehicle emission factor curves by speed. Returns chart and data table.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -23,14 +16,10 @@ Output: Speed-emission factor relationship chart + key data points table""",
                         "type": "string",
                         "description": "Vehicle type. Pass user's original expression (e.g., '小汽车', '公交车', 'SUV'). System will automatically recognize it."
                     },
-                    "pollutant": {
-                        "type": "string",
-                        "description": "Single pollutant name (e.g., 'CO2', 'NOx', 'PM2.5'). Use this for single pollutant query."
-                    },
                     "pollutants": {
                         "type": "array",
                         "items": {"type": "string"},
-                        "description": "List of pollutants for multi-pollutant query. Use this instead of 'pollutant' when querying multiple pollutants."
+                        "description": "List of pollutants to query (e.g., ['CO2', 'NOx', 'PM2.5']). Single pollutant also uses this array."
                     },
                     "model_year": {
                         "type": "integer",
@@ -57,17 +46,7 @@ Output: Speed-emission factor relationship chart + key data points table""",
         "type": "function",
         "function": {
             "name": "calculate_micro_emission",
-            "description": """Calculate detailed emissions for a single vehicle trajectory (microscopic emission).
-
-Use this when:
-- User has second-by-second trajectory data (speed over time)
-- User uploaded a trajectory file
-- User wants to calculate emissions for a specific trip
-
-**IMPORTANT**: When user uploads a file, you will see the file path in the context. Use that file_path parameter to calculate emissions.
-
-Input: Trajectory data (time + speed, acceleration and grade optional)
-Output: Second-by-second emission details + total emission summary + downloadable Excel file""",
+            "description": "Calculate second-by-second emissions from vehicle trajectory data (time + speed). Use file_path for uploaded files.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -106,15 +85,7 @@ Output: Second-by-second emission details + total emission summary + downloadabl
         "type": "function",
         "function": {
             "name": "calculate_macro_emission",
-            "description": """Calculate road link emissions (macroscopic emission).
-
-Use this when:
-- User has road link data (length, traffic flow, speed)
-- User uploaded a road network file
-- User wants to calculate emissions for a road segment or network
-
-Input: Link data (length + flow + speed, fleet composition optional)
-Output: Per-link emission details + total emission summary + downloadable Excel file""",
+            "description": "Calculate road link emissions from traffic data (length + flow + speed). Use file_path for uploaded files.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -153,14 +124,7 @@ Output: Per-link emission details + total emission summary + downloadable Excel 
         "type": "function",
         "function": {
             "name": "analyze_file",
-            "description": """Analyze uploaded file to identify its type and structure.
-
-Use this when:
-- User uploaded a file but didn't specify what to do with it
-- Need to understand file content before processing
-- File has non-standard column names
-
-Output: File type (trajectory/road link/other), column list, data preview, suggested processing method""",
+            "description": "Analyze uploaded file structure. Returns columns, data type, and preview.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -177,18 +141,7 @@ Output: File type (trajectory/road link/other), column list, data preview, sugge
         "type": "function",
         "function": {
             "name": "query_knowledge",
-            "description": """Query emission-related knowledge, standards, and regulations from knowledge base.
-
-Use this when:
-- User asks about emission standards (e.g., "什么是国六排放标准")
-- User wants to know regulations or policies
-- User asks about technical concepts or definitions
-- User asks about testing methods or procedures (e.g., "机动车尾气检测有哪些方法")
-- User asks about measurement standards or protocols
-- User needs reference information about emissions
-- User asks "what is", "how to", "what are the methods" type questions
-
-Output: Answer based on knowledge base with source references""",
+            "description": "Search emission knowledge base for standards, regulations, and technical concepts.",
             "parameters": {
                 "type": "object",
                 "properties": {

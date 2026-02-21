@@ -138,7 +138,8 @@ class FileAnalyzerTool(BaseTool):
             return "unknown", 0.3
 
     def _format_summary(self, analysis: Dict) -> str:
-        """Format analysis summary for LLM"""
+        """Format analysis summary for LLM — purely descriptive, no judgment"""
+        import json
         lines = [
             f"File: {analysis['filename']}",
             f"Rows: {analysis['row_count']}",
@@ -146,18 +147,7 @@ class FileAnalyzerTool(BaseTool):
             f"Detected type: {analysis['task_type']} (confidence: {analysis['confidence']:.0%})"
         ]
 
-        if analysis['task_type'] == 'micro_emission':
-            if analysis['micro_has_required']:
-                lines.append("✓ Has required columns for micro emission calculation")
-            else:
-                lines.append("✗ Missing required columns for micro emission")
-                lines.append(f"  Mapped: {analysis['micro_mapping']}")
-
-        elif analysis['task_type'] == 'macro_emission':
-            if analysis['macro_has_required']:
-                lines.append("✓ Has required columns for macro emission calculation")
-            else:
-                lines.append("✗ Missing required columns for macro emission")
-                lines.append(f"  Mapped: {analysis['macro_mapping']}")
+        if analysis.get('sample_rows'):
+            lines.append(f"Sample: {json.dumps(analysis['sample_rows'][:2], ensure_ascii=False)}")
 
         return "\n".join(lines)

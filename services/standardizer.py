@@ -219,6 +219,10 @@ class UnifiedStandardizer:
         """
         Map column names to standard names
 
+        Strategy:
+        1. Exact match against patterns
+        2. Substring match (column contains pattern or pattern contains column)
+
         Args:
             columns: List of column names from user's file
             task_type: "micro_emission" or "macro_emission"
@@ -232,7 +236,8 @@ class UnifiedStandardizer:
         for col in columns:
             col_lower = col.lower().strip()
 
-            # Try to match against each field's patterns
+            # Pass 1: Exact match
+            matched = False
             for field_name, field_config in patterns.items():
                 standard_name = field_config.get("standard")
                 pattern_list = field_config.get("patterns", [])
@@ -240,11 +245,35 @@ class UnifiedStandardizer:
                 for pattern in pattern_list:
                     if col_lower == pattern.lower():
                         mapping[col] = standard_name
-                        logger.debug(f"Column mapped: '{col}' -> '{standard_name}'")
+                        matched = True
                         break
-
-                if col in mapping:
+                if matched:
                     break
+
+            if matched:
+                continue
+
+            # Pass 2: Substring match (col contains pattern or pattern contains col)
+            best_field = None
+            best_len = 0
+            for field_name, field_config in patterns.items():
+                standard_name = field_config.get("standard")
+                if standard_name in mapping.values():
+                    continue  # Already mapped this field
+                pattern_list = field_config.get("patterns", [])
+
+                for pattern in pattern_list:
+                    p_lower = pattern.lower()
+                    if len(p_lower) < 3:
+                        continue  # Skip very short patterns for substring match
+                    if p_lower in col_lower or col_lower in p_lower:
+                        if len(p_lower) > best_len:
+                            best_len = len(p_lower)
+                            best_field = (col, standard_name)
+
+            if best_field:
+                mapping[best_field[0]] = best_field[1]
+                logger.debug(f"Column substring match: '{best_field[0]}' -> '{best_field[1]}'")
 
         return mapping
 
