@@ -464,8 +464,17 @@ async def chat_stream(
             }, ensure_ascii=False) + "\n"
             await asyncio.sleep(0.1)
 
-            # 5. 调用Router处理
-            result = await session.chat(message_with_file, input_file_path)
+            # 5. 调用Router处理（带心跳保活）
+            heartbeat_msg = json.dumps({"type": "heartbeat"}, ensure_ascii=False) + "\n"
+            chat_task = asyncio.create_task(session.chat(message_with_file, input_file_path))
+            while not chat_task.done():
+                try:
+                    result = await asyncio.wait_for(asyncio.shield(chat_task), timeout=15)
+                    break
+                except asyncio.TimeoutError:
+                    yield heartbeat_msg
+            else:
+                result = chat_task.result()
 
             # 6. 流式输出最终文本
             reply_text = result.get("text", "")
