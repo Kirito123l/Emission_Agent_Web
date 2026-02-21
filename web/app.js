@@ -22,6 +22,14 @@ function fetchWithUser(url, options = {}) {
     return fetch(url, { ...options, headers });
 }
 
+// 页面加载时显示用户短ID
+document.addEventListener('DOMContentLoaded', () => {
+    const el = document.getElementById('user-display-name');
+    if (el) {
+        el.textContent = '用户 ' + getUserId().substring(0, 8);
+    }
+});
+
 // ==================== DOM元素 ====================
 const messagesContainer = document.getElementById('messages-container');
 const messageInput = document.querySelector('#input-area textarea');
@@ -214,6 +222,10 @@ async function sendMessageStream(message, file) {
                     const data = JSON.parse(line);
 
                     switch (data.type) {
+                        case 'heartbeat':
+                            // 心跳包，忽略
+                            break;
+
                         case 'status':
                             // 更新状态提示
                             showTypingIndicator(data.content);
