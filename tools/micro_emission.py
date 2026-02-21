@@ -58,11 +58,11 @@ class MicroEmissionTool(BaseTool):
                 logger.info(f"[MicroEmission] Mapped file_path to input_file: {kwargs['file_path']}")
 
             # DIAGNOSTIC LOGGING
-            logger.info("=" * 50)
-            logger.info("[MicroEmission] FULL PARAMS DUMP:")
+            logger.debug("=" * 50)
+            logger.debug("[MicroEmission] FULL PARAMS DUMP:")
             for k, v in kwargs.items():
-                logger.info(f"  {k}: {v} (type: {type(v).__name__})")
-            logger.info("=" * 50)
+                logger.debug(f"  {k}: {v} (type: {type(v).__name__})")
+            logger.debug("=" * 50)
 
             # 1. Extract parameters
             vehicle_type = kwargs.get("vehicle_type")

@@ -33,6 +33,9 @@ class ContextAssembler:
         self.config = ConfigLoader.load_prompts()
         self.tools = ConfigLoader.load_tool_definitions()
 
+    # Max chars to keep per assistant response in working memory
+    MAX_ASSISTANT_RESPONSE_CHARS = 300
+
     def assemble(
         self,
         user_message: str,
@@ -48,7 +51,7 @@ class ContextAssembler:
         2. Tool definitions (~400 tokens) - MUST
         3. Fact memory (~100 tokens) - Important
         4. Working memory (~3000 tokens) - Important
-        5. File context (~500 tokens) - Optional
+        5. File context (~500 tokens) - When file uploaded, ELEVATED priority
 
         Args:
             user_message: Current user message
@@ -59,6 +62,7 @@ class ContextAssembler:
         Returns:
             AssembledContext ready for LLM
         """
+        has_file = file_context is not None
         used_tokens = 0
 
         # 1. Core prompt (MUST)
@@ -86,21 +90,25 @@ class ContextAssembler:
         remaining_budget = self.MAX_CONTEXT_TOKENS - used_tokens - 500
         working_memory_messages = self._format_working_memory(
             working_memory,
-            max_tokens=remaining_budget
+            max_tokens=remaining_budget,
+            max_turns=3
         )
         messages.extend(working_memory_messages)
         used_tokens += self._estimate_tokens(str(working_memory_messages))
 
-        # 3.3 Add file context if available
+        # 3.3 Add file context if available — make it prominent
         if file_context:
             file_summary = self._format_file_context(file_context, max_tokens=500)
-            user_message = f"[File uploaded]\n{file_summary}\n\n[User message]\n{user_message}"
+            user_message = f"{file_summary}\n\n{user_message}"
 
         # 3.4 Add current user message
         messages.append({"role": "user", "content": user_message})
         used_tokens += self._estimate_tokens(user_message)
 
-        logger.info(f"Assembled context: ~{used_tokens} tokens, {len(messages)} messages")
+        logger.info(
+            f"Assembled context: ~{used_tokens} tokens, {len(messages)} messages, "
+            f"has_file={has_file}, working_memory_turns={len(working_memory)}"
+        )
 
         return AssembledContext(
             system_prompt=system_prompt,
@@ -131,34 +139,41 @@ class ContextAssembler:
     def _format_working_memory(
         self,
         working_memory: List[Dict],
-        max_tokens: int
+        max_tokens: int,
+        max_turns: int = 3
     ) -> List[Dict]:
         """
         Format working memory for LLM
 
-        Strategy: Keep last 3 complete turns
-        If over budget, keep last 2 turns
+        Strategy: Keep last N complete turns (default 3, reduced when file uploaded)
+        Truncate long assistant responses to prevent pattern bias
+        If over budget, drop oldest turns
         """
         if not working_memory:
             return []
 
-        # Keep last 3 turns
-        recent = working_memory[-3:]
+        recent = working_memory[-max_turns:]
 
         result = []
         for turn in recent:
             result.append({"role": "user", "content": turn["user"]})
-            result.append({"role": "assistant", "content": turn["assistant"]})
+            # Truncate long assistant responses to prevent context pollution
+            assistant_text = turn["assistant"]
+            if len(assistant_text) > self.MAX_ASSISTANT_RESPONSE_CHARS:
+                assistant_text = assistant_text[:self.MAX_ASSISTANT_RESPONSE_CHARS] + "...(truncated)"
+            result.append({"role": "assistant", "content": assistant_text})
 
-        # Simple token check
+        # Token budget check — drop oldest if over budget
         estimated = self._estimate_tokens(str(result))
-        if estimated > max_tokens and len(recent) > 2:
-            # Drop oldest turn
-            recent = working_memory[-2:]
+        if estimated > max_tokens and len(recent) > 1:
+            recent = recent[-1:]
             result = []
             for turn in recent:
                 result.append({"role": "user", "content": turn["user"]})
-                result.append({"role": "assistant", "content": turn["assistant"]})
+                assistant_text = turn["assistant"]
+                if len(assistant_text) > self.MAX_ASSISTANT_RESPONSE_CHARS:
+                    assistant_text = assistant_text[:self.MAX_ASSISTANT_RESPONSE_CHARS] + "...(truncated)"
+                result.append({"role": "assistant", "content": assistant_text})
 
         return result
 
@@ -166,11 +181,17 @@ class ContextAssembler:
         """Format file context for LLM"""
         lines = [
             f"Filename: {file_context.get('filename', 'unknown')}",
-            f"File path: {file_context.get('file_path', 'unknown')}",  # Add file path!
-            f"Type: {file_context.get('detected_type', 'unknown')}",
+            f"File path: {file_context.get('file_path', 'unknown')}",
+        ]
+
+        # Highlight task_type prominently — system prompt tells LLM to use this
+        task_type = file_context.get("task_type") or file_context.get("detected_type", "unknown")
+        lines.append(f"task_type: {task_type}")
+
+        lines.extend([
             f"Rows: {file_context.get('row_count', 'unknown')}",
             f"Columns: {', '.join(file_context.get('columns', []))}",
-        ]
+        ])
 
         # Add sample data if space available
         if max_tokens > 300 and file_context.get("sample_rows"):

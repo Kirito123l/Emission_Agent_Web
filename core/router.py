@@ -16,83 +16,19 @@ logger = logging.getLogger(__name__)
 
 
 # Synthesis-only prompt (no tool calling)
-SYNTHESIS_PROMPT = """你是机动车排放计算助手。请基于工具执行结果生成专业的分析回答。
+SYNTHESIS_PROMPT = """你是机动车排放计算助手。基于工具执行结果生成专业回答。
 
-## 回答要求
-1. **只使用实际数据**: 只使用下方提供的工具执行结果中的数值，不要编造数据
-2. **结合结果分析**:
-   - ✅ 总结关键计算结果（总排放量、总距离、总时间等）
-   - ✅ 对比不同污染物的排放量
-   - ✅ 说明计算参数（车型、年份、季节等）
-   - ✅ 提供简要的结果解读
-   - ❌ 不要编造未在结果中出现的数值
-   - ❌ 不要进行复杂的数学推导或单位转换
-3. **专业且易懂**: 使用专业术语，但保持通俗易懂
-4. **参考文档处理**:
-   - ✅ 如果工具是 query_knowledge，必须完整保留工具返回的答案内容（包括末尾的"**参考文档**："部分）
-   - ❌ 如果工具是其他工具（query_emission_factors、calculate_micro_emission等），不要添加"参考文档"或"参考来源"字样
-
-## 回答结构
-
-### 微观排放计算成功时：
-```
-已完成微观排放计算。
-
-**计算参数：**
-- 车型：{vehicle_type}
-- 污染物：{pollutants}
-- 年份：{model_year}
-- 季节：{season}
-
-**计算结果：**
-- 轨迹数据点：{num_points} 个
-- 总行驶距离：{total_distance_km} km
-- 总运行时间：{total_time_s} 秒
-- 总排放量：
-  - CO2: {value} g
-  - NOx: {value} g
-  - PM2.5: {value} g
-
-**结果分析：**
-[基于实际数据进行简要分析，例如：主要污染物是CO2，占总排放量的XX%；NOx和PM2.5排放量相对较低]
-
-详细的逐秒排放数据请下载结果文件查看。
-```
-
-### 宏观排放计算成功时：
-```
-已完成宏观排放计算。
-
-**计算参数：**
-- 路段数量：{num_links} 个
-- 污染物：{pollutants}
-- 年份：{model_year}
-- 季节：{season}
-
-**计算结果：**
-- 总排放量：
-  - CO2: {value} g/h
-  - NOx: {value} g/h
-  - PM2.5: {value} g/h
-
-**结果分析：**
-[基于实际数据进行简要分析，例如：路网总排放量为XX g/h，其中CO2占主导地位]
-
-详细的路段排放数据请下载结果文件查看。
-```
-
-### 失败时：
-```
-计算遇到问题：{error_message}
-
-建议：{具体建议}
-```
+## 要求
+1. 只使用工具返回的实际数据，不要编造或推算数值
+2. 总结关键结果（总排放量、计算参数、统计信息）
+3. query_knowledge 工具：完整保留返回的答案和参考文档
+4. 其他工具：不要添加"参考文档"字样
+5. 失败时说明问题并给出建议
 
 ## 工具执行结果
 {results}
 
-请基于以上结果生成回答，包含关键数据总结和简要分析。
-"""
+请生成简洁专业的回答。"""
 
 
 @dataclass
@@ -149,10 +85,45 @@ class UnifiedRouter:
         """
         logger.info(f"Processing message: {user_message[:50]}...")
 
-        # 1. Analyze file if provided
+        # 1. Analyze file if provided (use cache when available)
         file_context = None
         if file_path:
-            file_context = await self._analyze_file(file_path)
+            from pathlib import Path
+            import os
+
+            cached = self.memory.get_fact_memory().get("file_analysis")
+            file_path_str = str(file_path)
+
+            # Check if file exists and get its modification time
+            try:
+                current_mtime = os.path.getmtime(file_path_str)
+            except Exception:
+                current_mtime = None
+
+            # Use cache only if path and mtime match
+            cache_valid = (
+                cached
+                and str(cached.get("file_path")) == file_path_str
+                and cached.get("file_mtime") == current_mtime
+            )
+
+            if cache_valid:
+                file_context = cached
+                logger.info(f"Using cached file analysis for {file_path}")
+            else:
+                file_context = await self._analyze_file(file_path)
+                # Store path and mtime to detect file changes
+                file_context["file_path"] = file_path_str
+                file_context["file_mtime"] = current_mtime
+                logger.info(f"Analyzed new file: {file_path} (mtime: {current_mtime})")
+            # Diagnostic: log memory state when file is uploaded
+            wm = self.memory.get_working_memory()
+            fm = self.memory.get_fact_memory()
+            logger.info(
+                f"[FILE UPLOAD] working_memory_turns={len(wm)}, "
+                f"fact_memory={fm}, "
+                f"file_task_type={file_context.get('task_type') or file_context.get('detected_type')}"
+            )
 
         # 2. Assemble context
         context = self.assembler.assemble(
@@ -192,7 +163,8 @@ class UnifiedRouter:
             user_message=user_message,
             assistant_response=result.text,
             tool_calls=tool_calls_data,
-            file_path=file_path
+            file_path=file_path,
+            file_analysis=file_context
         )
 
         return result
@@ -229,16 +201,36 @@ class UnifiedRouter:
             logger.info(f"Executing tool: {tool_call.name}")
             logger.debug(f"Tool arguments: {tool_call.arguments}")
 
-            # Guardrail: for micro emission with uploaded trajectory file, require explicit vehicle grounding
+            # Simple rule: For micro emission calculation, require explicit vehicle type mention
             if tool_call.name == "calculate_micro_emission":
-                clarification = await self._maybe_require_vehicle_confirmation(
-                    arguments=tool_call.arguments,
-                    context=context,
-                    file_path=file_path
-                )
-                if clarification:
-                    logger.info("[Guardrail] Vehicle type not grounded, asking clarification before execution")
-                    return RouterResponse(text=clarification)
+                vehicle_type = tool_call.arguments.get("vehicle_type")
+                if vehicle_type:
+                    # Check if user message contains vehicle-related keywords
+                    user_msg = context.messages[-1].get("content", "").lower()
+                    vehicle_keywords = [
+                        "小汽车", "轿车", "乘用车", "私家车", "sedan", "passenger car",
+                        "公交", "客车", "bus", "transit",
+                        "货车", "卡车", "truck", "cargo",
+                        "suv", "越野",
+                        "摩托", "motorcycle",
+                        "柴油车", "汽油车", "diesel", "gasoline"
+                    ]
+                    has_vehicle_mention = any(kw in user_msg for kw in vehicle_keywords)
+
+                    # Also check fact memory for recent vehicle
+                    recent_vehicle = self.memory.get_fact_memory().get("recent_vehicle")
+                    refers_to_previous = any(kw in user_msg for kw in ["同上", "沿用", "和之前", "还是", "一样"])
+
+                    if not has_vehicle_mention and not (recent_vehicle and refers_to_previous):
+                        logger.info(f"[Vehicle Check] No explicit vehicle mention found, asking for confirmation")
+                        return RouterResponse(
+                            text="请先告诉我车辆类型，例如：\n"
+                                 "- 小汽车（乘用车）\n"
+                                 "- 公交车\n"
+                                 "- 货车\n"
+                                 "- SUV\n"
+                                 "或者其他具体车型。"
+                        )
 
             result = await self.executor.execute(
                 tool_name=tool_call.name,
@@ -539,141 +531,6 @@ class UnifiedRouter:
 
         # For non-calculation tools, keep original summary
         return result.get("summary") or "执行完成。"
-
-    def _extract_current_user_message(self, context) -> str:
-        if not context or not context.messages:
-            return ""
-        user_message = context.messages[-1].get("content", "")
-        match = re.search(r"\[User message\]\s*(.*)$", user_message, re.S)
-        return match.group(1).strip() if match else user_message.strip()
-
-    def _message_contains_vehicle_mention(self, text: str) -> bool:
-        if not text:
-            return False
-        try:
-            from services.standardizer import get_standardizer
-            standardizer = get_standardizer()
-        except Exception:
-            standardizer = None
-
-        # Fast keyword pre-check for common mentions
-        quick_keywords = [
-            "小汽车", "轿车", "乘用车", "公交", "客车", "货车", "卡车", "摩托",
-            "passenger car", "bus", "truck", "suv", "motorcycle",
-        ]
-        lower = text.lower()
-        if any(k in lower for k in quick_keywords):
-            return True
-
-        # Use lookup-based semantic check to avoid noisy warning logs
-        if standardizer:
-            vehicle_keys = set(getattr(standardizer, "vehicle_lookup", {}).keys())
-            candidates = re.split(r"[，。,.!?！？\s/;；:：()（）]+", text)
-            for c in candidates:
-                token = c.strip().lower()
-                if not token:
-                    continue
-                if len(token) <= 1:
-                    continue
-                if token in vehicle_keys:
-                    return True
-        return False
-
-    async def _assess_vehicle_grounding_with_llm(
-        self,
-        current_user_message: str,
-        proposed_vehicle: Optional[str],
-        recent_vehicle: Optional[str]
-    ) -> Optional[bool]:
-        """
-        Use LLM to decide whether vehicle type is explicitly grounded by user.
-        Returns:
-            True  -> grounded, can execute
-            False -> not grounded, should clarify
-            None  -> LLM failed, caller should fallback
-        """
-        prompt = f"""
-判断是否可以直接执行“微观排放计算”而不再追问车型。
-
-当前用户消息:
-{current_user_message}
-
-模型拟使用车型:
-{proposed_vehicle}
-
-历史已确认车型:
-{recent_vehicle}
-
-判定标准:
-1) 若当前消息明确给出车型，can_proceed=true
-2) 若当前消息未给车型，但明确表达“沿用之前车型”且历史有车型，can_proceed=true
-3) 其余情况 can_proceed=false
-
-只输出JSON:
-{{"can_proceed": true/false, "reason": "简短原因"}}
-"""
-        try:
-            resp = await self.llm.chat(
-                messages=[{"role": "user", "content": prompt}],
-                system="你是参数来源校验器。只输出JSON，不要额外文本。"
-            )
-            content = (resp.content or "").strip()
-            json_match = re.search(r"\{[\s\S]*\}", content)
-            if not json_match:
-                return None
-            parsed = json.loads(json_match.group(0))
-            can_proceed = parsed.get("can_proceed")
-            if isinstance(can_proceed, bool):
-                return can_proceed
-            return None
-        except Exception as e:
-            logger.warning(f"[Guardrail] LLM grounding check failed: {e}")
-            return None
-
-    async def _maybe_require_vehicle_confirmation(self, arguments: Dict, context, file_path: Optional[str]) -> Optional[str]:
-        """
-        Decide whether to block micro calculation and ask user to confirm vehicle type.
-        Only applies to file-based micro calculation where hallucinated defaults are costly.
-        """
-        # Only enforce when working on uploaded file (main risk path)
-        has_file = bool(file_path or arguments.get("file_path") or arguments.get("input_file"))
-        if not has_file:
-            return None
-
-        proposed_vehicle = arguments.get("vehicle_type")
-        if not proposed_vehicle:
-            return (
-                "检测到轨迹文件，但还缺少车型信息。\n\n"
-                "请先确认车型，例如：小汽车、公交车、货车、SUV。"
-            )
-
-        current_user_message = self._extract_current_user_message(context)
-        recent_vehicle = self.memory.get_fact_memory().get("recent_vehicle")
-
-        # 1) LLM semantic grounding check (AI-first)
-        llm_decision = await self._assess_vehicle_grounding_with_llm(
-            current_user_message=current_user_message,
-            proposed_vehicle=proposed_vehicle,
-            recent_vehicle=recent_vehicle
-        )
-        if llm_decision is True:
-            return None
-        if llm_decision is False:
-            return (
-                f"我准备按 **{proposed_vehicle}** 进行微观排放计算，但当前消息里没有明确确认车型。\n\n"
-                "请确认本次车辆类型（例如：小汽车 / 公交车 / 货车 / SUV）。"
-            )
-
-        # 2) Fallback deterministic check
-        user_has_vehicle = self._message_contains_vehicle_mention(current_user_message)
-        refer_previous = any(k in current_user_message for k in ["同上", "沿用", "和之前", "按之前", "还是那个"])
-        if user_has_vehicle or (refer_previous and recent_vehicle):
-            return None
-
-        return (
-            f"我准备按 **{proposed_vehicle}** 进行微观排放计算，但尚未确认这是你指定的车型。\n\n"
-            "请明确告诉我本次车辆类型。"
-        )
 
     def _filter_results_for_synthesis(self, tool_results: list) -> Dict:
         """

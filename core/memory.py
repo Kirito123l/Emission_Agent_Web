@@ -4,12 +4,24 @@ Manages conversation history and context
 """
 import json
 import logging
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Any
 from datetime import datetime
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
+
+
+def _convert_paths_to_strings(obj: Any) -> Any:
+    """Recursively convert Path objects to strings for JSON serialization"""
+    if isinstance(obj, Path):
+        return str(obj)
+    elif isinstance(obj, dict):
+        return {k: _convert_paths_to_strings(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [_convert_paths_to_strings(item) for item in obj]
+    else:
+        return obj
 
 
 @dataclass
@@ -19,6 +31,7 @@ class FactMemory:
     recent_pollutants: List[str] = field(default_factory=list)
     recent_year: Optional[int] = None
     active_file: Optional[str] = None
+    file_analysis: Optional[Dict] = None
     user_preferences: Dict = field(default_factory=dict)
 
 
@@ -74,6 +87,7 @@ class MemoryManager:
             "recent_pollutants": self.fact_memory.recent_pollutants,
             "recent_year": self.fact_memory.recent_year,
             "active_file": self.fact_memory.active_file,
+            "file_analysis": self.fact_memory.file_analysis,
         }
 
     def update(
@@ -81,7 +95,8 @@ class MemoryManager:
         user_message: str,
         assistant_response: str,
         tool_calls: Optional[List[Dict]] = None,
-        file_path: Optional[str] = None
+        file_path: Optional[str] = None,
+        file_analysis: Optional[Dict] = None
     ):
         """
         Update memory after a conversation turn
@@ -91,6 +106,7 @@ class MemoryManager:
             assistant_response: Assistant's response
             tool_calls: Optional tool calls made
             file_path: Optional file path if file was uploaded
+            file_analysis: Optional cached file analysis result
         """
         # 1. Add to working memory
         turn = Turn(
@@ -104,9 +120,12 @@ class MemoryManager:
         if tool_calls:
             self._extract_facts_from_tool_calls(tool_calls)
 
-        # 3. Update active file
+        # 3. Update active file and cache analysis
         if file_path:
-            self.fact_memory.active_file = file_path
+            self.fact_memory.active_file = str(file_path)
+            if file_analysis:
+                # Convert any Path objects to strings before storing
+                self.fact_memory.file_analysis = _convert_paths_to_strings(file_analysis)
 
         # 4. Detect user corrections
         self._detect_correction(user_message)
@@ -194,7 +213,8 @@ class MemoryManager:
                 "recent_vehicle": self.fact_memory.recent_vehicle,
                 "recent_pollutants": self.fact_memory.recent_pollutants,
                 "recent_year": self.fact_memory.recent_year,
-                "active_file": str(self.fact_memory.active_file) if self.fact_memory.active_file else None,
+                "active_file": self.fact_memory.active_file,
+                "file_analysis": _convert_paths_to_strings(self.fact_memory.file_analysis),
             },
             "compressed_memory": self.compressed_memory,
             "working_memory": [
@@ -233,6 +253,7 @@ class MemoryManager:
                 self.fact_memory.recent_pollutants = fm.get("recent_pollutants", [])
                 self.fact_memory.recent_year = fm.get("recent_year")
                 self.fact_memory.active_file = fm.get("active_file")
+                self.fact_memory.file_analysis = fm.get("file_analysis")
 
             # Load compressed memory
             self.compressed_memory = data.get("compressed_memory", "")

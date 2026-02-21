@@ -2,6 +2,7 @@
 import uvicorn
 import logging
 import sys
+import os
 
 # 配置根日志记录器
 logging.basicConfig(
@@ -18,12 +19,13 @@ for logger_name in ['uvicorn', 'uvicorn.access', 'uvicorn.error', 'api', 'api.ma
     logger.propagate = True
 
 if __name__ == "__main__":
+    port = int(os.getenv("PORT", "8000"))
     print("=" * 60)
     print("🌿 Emission Agent API Server")
     print("=" * 60)
     print("服务器启动中...")
-    print("访问地址: http://localhost:8000")
-    print("API文档: http://localhost:8000/docs")
+    print(f"访问地址: http://localhost:{port}")
+    print(f"API文档: http://localhost:{port}/docs")
     print("=" * 60)
 
     # 配置 uvicorn 日志
@@ -34,7 +36,7 @@ if __name__ == "__main__":
     uvicorn.run(
         "api.main:app",
         host="0.0.0.0",
-        port=8000,
+        port=port,
         reload=False,
         log_level="info",
         access_log=True,

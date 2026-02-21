@@ -87,57 +87,15 @@ class MacroEmissionTool(BaseTool):
         return fixed_links
 
     def _standardize_fleet_mix(self, fleet_mix: Optional[Dict]) -> Optional[Dict]:
-        """Standardize fleet mix vehicle names to MOVES standard names."""
+        """Standardize fleet mix using centralized standardizer."""
         if not fleet_mix or not isinstance(fleet_mix, dict):
             return None
 
-        try:
-            from services.standardizer import get_standardizer
-            standardizer = get_standardizer()
-        except Exception as e:
-            logger.warning(f"[MacroEmission] Standardizer unavailable for fleet_mix: {e}")
-            standardizer = None
+        from services.standardizer import get_standardizer
+        standardizer = get_standardizer()
+        supported = set(self._calculator.VEHICLE_TO_SOURCE_TYPE.keys())
 
-        supported_vehicle_types = set(self._calculator.VEHICLE_TO_SOURCE_TYPE.keys())
-
-        alias_map = {
-            "小汽车": "Passenger Car",
-            "乘用车": "Passenger Car",
-            "私家车": "Passenger Car",
-            "轿车": "Passenger Car",
-            "公交车": "Transit Bus",
-            "城市公交": "Transit Bus",
-            "客车": "Transit Bus",
-            "大客车": "Transit Bus",
-            "轻型货车": "Light Commercial Truck",
-            "轻卡": "Light Commercial Truck",
-            "货车": "Combination Long-haul Truck",
-            "卡车": "Combination Long-haul Truck",
-            "重型货车": "Combination Long-haul Truck",
-            "重卡": "Combination Long-haul Truck",
-            "柴油货车": "Combination Long-haul Truck",
-            "长途货车": "Combination Long-haul Truck",
-        }
-
-        def fallback_standardize(name: str) -> str:
-            raw = name.strip()
-            if raw in supported_vehicle_types:
-                return raw
-            if raw in alias_map:
-                return alias_map[raw]
-            lower = raw.lower()
-            if "passenger car" in lower or "sedan" in lower:
-                return "Passenger Car"
-            if "bus" in lower:
-                return "Transit Bus"
-            if "light" in lower and "truck" in lower:
-                return "Light Commercial Truck"
-            if "truck" in lower:
-                return "Combination Long-haul Truck"
-            return raw
-
-        standardized: Dict[str, float] = {}
-
+        result = {}
         for raw_name, raw_pct in fleet_mix.items():
             try:
                 pct = float(raw_pct)
@@ -145,23 +103,13 @@ class MacroEmissionTool(BaseTool):
                 continue
             if pct <= 0:
                 continue
-
-            std_name = None
-            if standardizer:
-                std_name = standardizer.standardize_vehicle(str(raw_name))
-            if (not std_name) or (std_name not in supported_vehicle_types):
-                std_name = fallback_standardize(str(raw_name))
-
-            if std_name not in supported_vehicle_types:
-                logger.warning(f"[MacroEmission] Unsupported vehicle type after standardization: {raw_name} -> {std_name}")
-                continue
-
-            if std_name in standardized:
-                standardized[std_name] += pct
+            std_name = standardizer.standardize_vehicle(str(raw_name))
+            if std_name and std_name in supported:
+                result[std_name] = result.get(std_name, 0) + pct
             else:
-                standardized[std_name] = pct
+                logger.warning(f"Unsupported vehicle in fleet_mix: {raw_name}")
 
-        return standardized if standardized else None
+        return result if result else None
 
     def _apply_global_fleet_mix(self, links_data: List[Dict], global_fleet_mix: Optional[Dict]) -> List[Dict]:
         """

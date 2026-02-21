@@ -350,6 +350,9 @@ column_patterns:
         - "flow_vph"
         - "flow"
         - "traffic"
+        - "daily_traffic"
+        - "traffic_flow"
+        - "traffic_count"
         - "link_volume_veh_per_hour"
         - "volume_veh_per_hour"
         - "volume"
@@ -357,6 +360,8 @@ column_patterns:
         - "流量"
         - "traffic_volume"
         - "vehicle_flow"
+        - "aadt"
+        - "vph"
       description: "Traffic flow in vehicles per hour"
 
     speed:
@@ -364,11 +369,13 @@ column_patterns:
       required: true
       patterns:
         - "avg_speed_kph"
+        - "avg_speed"
         - "speed_kph"
         - "speed"
         - "link_avg_speed_kmh"
         - "avg_speed_kmh"
         - "speed_kmh"
+        - "mean_speed"
         - "平均速度"
         - "速度"
         - "average_speed"
@@ -379,6 +386,8 @@ column_patterns:
       required: false  # Auto-generated if missing
       patterns:
         - "link_id"
+        - "segment_id"
+        - "road_id"
         - "id"
         - "路段ID"
         - "路段编号"
