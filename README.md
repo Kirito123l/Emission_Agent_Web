@@ -4,7 +4,9 @@ Intelligent vehicle emission calculation system with modern Tool Use architectur
 
 ## Project Features
 
+- **AI-First Architecture**: Trust LLM intelligence, minimal rules, natural retry mechanism
 - **Tool Use Architecture**: Modern LLM function calling with transparent parameter standardization
+- **Smart File Caching**: File modification time detection for accurate cache invalidation
 - **Smart Column Mapping**: LLM-powered understanding of arbitrary Excel column names
 - **Local Model Support**: Support for locally fine-tuned Qwen3-4B models for cost reduction and data privacy
 - **Web Interface**: Modern chat-based web UI with file upload, chart display, and session management
@@ -44,10 +46,25 @@ emission_agent/
 
 ### Design Principles
 
-1. **Tool Use Mode**: Uses OpenAI function calling standard for tool execution
-2. **Transparent Standardization**: Parameters are standardized in executor layer, invisible to LLM
-3. **Three-Layer Memory**: Working memory + Fact memory + Compressed memory
-4. **Clean Separation**: Router → Assembler → LLM → Executor → Tools
+1. **AI-First Philosophy**: Trust LLM to make intelligent decisions with good information, avoid rigid rules
+2. **Tool Use Mode**: Uses OpenAI function calling standard for tool execution
+3. **Transparent Standardization**: Parameters are standardized in executor layer, invisible to LLM
+4. **Three-Layer Memory**: Working memory (5 turns) + Fact memory (structured) + Compressed memory
+5. **Smart File Caching**: File mtime detection prevents stale cache when files are overwritten
+6. **Clean Separation**: Router → Assembler → LLM → Executor → Tools
+
+### Recent Improvements (Latest)
+
+**AI-First Architecture Optimization** (2026-02-21)
+- Removed vehicle guardrail (~130 lines): Let LLM handle vehicle grounding naturally
+- Simplified synthesis prompt (76→15 lines): Reduce token usage, prevent hallucination
+- Streamlined tool definitions: Save ~200 tokens per request
+- Centralized fleet mix standardization: Remove duplicate code (~125 lines)
+- **File caching fix**: Added mtime detection to prevent using stale cached analysis when files are overwritten
+- Vehicle type confirmation: Python rule check before micro emission calculation
+- PORT environment variable support: Flexible port configuration
+
+Net result: -165 lines, faster responses, more reliable file handling.
 
 ## Quick Start
 
@@ -76,7 +93,12 @@ QWEN_API_KEY=your-api-key-here
 python run_api.py
 ```
 
-Service will start at http://localhost:8000
+Service will start at http://localhost:8000 (or use PORT environment variable to customize)
+
+```bash
+# Use custom port
+PORT=8001 python run_api.py
+```
 
 ### 4. Access Web Interface
 
@@ -281,12 +303,15 @@ class MyTool(BaseTool):
 
 ## Architecture Upgrade
 
-This project has been upgraded from the old Agent-Skill architecture to a modern Tool Use architecture. See:
-- `PHASE6_COMPLETE.md` - Integration testing
-- `PHASE7_COMPLETE.md` - API adaptation
-- `PHASE8_COMPLETE.md` - Cleanup and documentation
+This project uses a modern **Tool Use architecture** optimized for AI-first decision making. See detailed documentation:
+- **[ARCHITECTURE.md](docs/ARCHITECTURE.md)** - Complete architecture documentation with workflow details
+- **[AI-First Design Philosophy](docs/ARCHITECTURE.md#ai-first-philosophy)** - Why we trust LLM intelligence over rigid rules
 
-Old code is archived in `agent_old/` for reference.
+Key architectural decisions:
+- Removed complex guardrails, let LLM make natural decisions
+- Minimal synthesis prompt (15 lines) for faster, more accurate responses
+- File caching with mtime detection for reliable multi-file workflows
+- Python rule checks only for critical business logic (e.g., vehicle type confirmation)
 
 ## License
 

@@ -1,1688 +1,1826 @@
 # Emission Agent 架构文档
 
+> **版本**: v2.0 (AI-First Architecture)
+> **更新日期**: 2026-02-21
+> **架构类型**: Tool Use (OpenAI Function Calling)
+
 ## 目录
 
 1. [系统概述](#系统概述)
-2. [整体架构](#整体架构)
-3. [核心组件](#核心组件)
-4. [工作流程](#工作流程)
-5. [数据流](#数据流)
-6. [Agent-Skill架构](#agent-skill架构)
-7. [上下文管理](#上下文管理)
-8. [智能列名映射](#智能列名映射)
-9. [Web架构](#web架构)
-10. [关键技术](#关键技术)
-11. [最近改进 (v1.2.0)](#最近改进-v120)
+2. [AI-First 设计哲学](#ai-first-设计哲学)
+3. [整体架构](#整体架构)
+4. [核心组件详解](#核心组件详解)
+5. [完整工作流程](#完整工作流程)
+6. [三层记忆系统](#三层记忆系统)
+7. [文件处理与缓存](#文件处理与缓存)
+8. [工具系统](#工具系统)
+9. [参数标准化](#参数标准化)
+10. [关键技术细节](#关键技术细节)
+11. [性能优化](#性能优化)
+12. [部署架构](#部署架构)
 
 ---
 
 ## 系统概述
 
-Emission Agent 是一个基于 **Agent-Skill 架构** 的智能机动车排放计算系统。系统通过自然语言理解用户意图，自动调用相应的计算模块，并以对话形式返回结果。
+Emission Agent 是一个基于 **Tool Use 架构** 的智能机动车排放计算系统。系统采用 **AI-First** 设计理念，通过自然语言理解用户意图，自动调用相应的计算工具，并以对话形式返回结果。
 
-### 设计理念
+### 核心特性
 
-1. **Agent-Skill 分离**: Agent 层轻量，Skill 层重量
-2. **智能标准化**: 使用 LLM 进行车型/污染物标准化，而非硬编码规则
-3. **本地模型支持**: 支持本地微调模型，降低成本、提升性能、保护数据隐私
-4. **对话式交互**: 支持多轮对话、追问、上下文记忆
-5. **灵活性**: 支持多种输入方式（文本、文件、JSON）
+| 特性 | 描述 | 技术实现 |
+|------|------|----------|
+| AI-First | 信任 LLM 智能，最小化规则 | 移除复杂 guardrail，自然重试机制 |
+| Tool Use | OpenAI 函数调用标准 | 5 个工具，透明参数标准化 |
+| 智能缓存 | 文件 mtime 检测 | 防止使用过期缓存 |
+| 三层记忆 | Working + Fact + Compressed | 高效上下文管理 |
+| 多轮对话 | 上下文理解与延续 | 记忆系统 + 事实提取 |
 
 ### 系统能力
 
-| 能力 | 描述 | 技术基础 |
-|------|------|----------|
-| 排放因子查询 | 查询 MOVES 数据库的速度-排放曲线 | MOVES Matrix |
-| 微观排放计算 | 基于逐秒轨迹计算排放 | VSP 方法 |
-| 宏观排放计算 | 基于路段数据计算排放 | MOVES-Matrix |
-| 知识检索 | 检索排放计算相关文档 | 向量检索 |
-| 智能映射 | 自动理解 Excel 列名 | LLM |
-| 本地标准化 | 使用本地微调模型进行标准化 | VLLM + LoRA |
+- **排放因子查询**: 查询 EPA MOVES 数据库的速度-排放曲线
+- **微观排放计算**: 基于逐秒轨迹数据计算排放（VSP 方法）
+- **宏观排放计算**: 基于路段数据和车队组成计算排放（MOVES-Matrix）
+- **文件分析**: 智能识别文件类型和任务类型
+- **知识检索**: 检索排放计算相关文档（预留）
+
+---
+
+## AI-First 设计哲学
+
+### 核心理念
+
+**"给 LLM 提供好的信息，而不是限制它的行为"**
+
+传统 Agent 系统倾向于用大量规则和 guardrail 来"保护" LLM，但这往往导致：
+- 代码复杂度高（~130 行 guardrail 代码）
+- Token 消耗大（76 行 synthesis prompt）
+- 响应速度慢（多次 LLM 调用）
+- 维护困难（规则冲突）
+
+AI-First 架构的做法：
+1. **信任 LLM**: 让 LLM 自然地理解和决策
+2. **提供好信息**: 清晰的工具定义、结构化的上下文
+3. **自然重试**: 失败时让 LLM 自己调整，而不是强制规则
+4. **最小规则**: 只在关键业务逻辑处使用 Python 规则检查
+
+### 实际改进
+
+| 改进项 | 优化前 | 优化后 | 效果 |
+|--------|--------|--------|------|
+| Vehicle Guardrail | 130 行 LLM 检查 | 删除 | 更自然的对话流程 |
+| Synthesis Prompt | 76 行详细指导 | 15 行核心指导 | 省 ~200 tokens/请求 |
+| Tool Definitions | 冗长的"Use this when" | 简洁的一句话描述 | 更清晰的工具理解 |
+| Fleet Mix 标准化 | 重复代码 125 行 | 集中化 24 行 | 代码复用 |
+| 文件缓存 | 仅路径比较 | 路径 + mtime | 可靠的缓存失效 |
+
+**净结果**: -165 行代码，更快的响应，更可靠的文件处理
 
 ---
 
 ## 整体架构
+
+### 架构图
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
 │                         用户界面层                                │
 │  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐           │
 │  │  Web 界面    │  │   CLI 界面   │  │   API 接口   │           │
+│  │  (index.html)│  │  (main.py)   │  │  (routes.py) │           │
 │  └──────────────┘  └──────────────┘  └──────────────┘           │
 └─────────────────────────────────────────────────────────────────┘
                               │
                               ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│                         Agent 层                                  │
+│                      核心路由层 (Router)                          │
+│  ┌────────────────────────────────────────────────────────────┐ │
+│  │  UnifiedRouter (core/router.py)                            │ │
+│  │  ├─ 处理用户消息                                            │ │
+│  │  ├─ 文件分析与缓存 (mtime 检测)                            │ │
+│  │  ├─ 调用 LLM 生成工具调用                                  │ │
+│  │  ├─ 执行工具并综合结果                                      │ │
+│  │  └─ 更新记忆系统                                            │ │
+│  └────────────────────────────────────────────────────────────┘ │
+└─────────────────────────────────────────────────────────────────┘
+         │                    │                    │
+         ▼                    ▼                    ▼
+┌──────────────┐    ┌──────────────┐    ┌──────────────┐
+│  Assembler   │    │   Executor   │    │    Memory    │
+│ (assembler.py│    │ (executor.py)│    │  (memory.py) │
+│              │    │              │    │              │
+│ 组装上下文    │    │ 执行工具      │    │ 三层记忆      │
+│ - 工作记忆    │    │ - 标准化参数  │    │ - Working    │
+│ - 事实记忆    │    │ - 调用工具    │    │ - Fact       │
+│ - 文件上下文  │    │ - 返回结果    │    │ - Compressed │
+└──────────────┘    └──────────────┘    └──────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                         工具层 (Tools)                            │
 │  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐           │
-│  │  Core Agent  │  │  Validator   │  │  Reflector   │           │
-│  │  (意图理解)   │  │  (参数验证)   │  │  (反思机制)   │           │
+│  │ 排放因子查询  │  │ 微观排放计算  │  │ 宏观排放计算  │           │
+│  │ emission_    │  │ micro_       │  │ macro_       │           │
+│  │ factors.py   │  │ emission.py  │  │ emission.py  │           │
 │  └──────────────┘  └──────────────┘  └──────────────┘           │
 │  ┌──────────────┐  ┌──────────────┐                             │
-│  │   Context    │  │   Learner    │                             │
-│  │  (上下文管理) │  │  (学习机制)   │                             │
+│  │  文件分析     │  │  知识检索     │                             │
+│  │ file_        │  │ knowledge.py │                             │
+│  │ analyzer.py  │  │  (预留)      │                             │
 │  └──────────────┘  └──────────────┘                             │
 └─────────────────────────────────────────────────────────────────┘
                               │
                               ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│                         Skill 层                                  │
+│                      计算引擎层 (Calculators)                     │
 │  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐           │
-│  │ 排放因子查询  │  │ 微观排放计算  │  │ 宏观排放计算  │           │
-│  └──────────────┘  └──────────────┘  └──────────────┘           │
-│  ┌──────────────┐                                              │
-│  │  知识检索     │                                              │
-│  └──────────────┘                                              │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                       共享服务层                                  │
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐           │
-│  │  标准化器     │  │  LLM 客户端  │  │  文件处理器  │           │
-│  │  (API/本地)  │  └──────────────┘  └──────────────┘           │
-│  └──────┬───────┘                                                │
-│         │                                                         │
-│         ├─ API模式: 调用云端LLM (qwen-flash)                     │
-│         └─ 本地模式: 调用本地VLLM服务 (Qwen3-4B + LoRA)          │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                       数据层                                      │
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐           │
-│  │ MOVES 数据   │  │ 向量索引      │  │  会话存储     │           │
+│  │ MOVES 查询   │  │ VSP 计算     │  │ 车队排放      │           │
+│  │ emission_    │  │ micro.py     │  │ macro.py     │           │
+│  │ factors.py   │  │              │  │              │           │
 │  └──────────────┘  └──────────────┘  └──────────────┘           │
 └─────────────────────────────────────────────────────────────────┘
                               │
                               ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│                    本地模型层 (可选)                              │
-│  ┌────────────────────────────────────────────────────────────┐ │
-│  │  WSL2 + VLLM Service (port 8001)                           │ │
-│  │  ├─ 基础模型: Qwen3-4B-Instruct-2507                       │ │
-│  │  ├─ LoRA适配器: unified (车型+污染物标准化)                │ │
-│  │  └─ LoRA适配器: column (列名映射)                          │ │
-│  └────────────────────────────────────────────────────────────┘ │
+│                       服务层 (Services)                           │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐           │
+│  │  LLM 客户端  │  │  标准化器     │  │  文件处理器  │           │
+│  │ llm_client.py│  │ standardizer │  │ (内置工具)   │           │
+│  │              │  │ .py          │  │              │           │
+│  └──────────────┘  └──────────────┘  └──────────────┘           │
 └─────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                       数据层 (Data)                               │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐           │
+│  │ MOVES 数据   │  │ 会话存储      │  │  临时文件     │           │
+│  │ (CSV)        │  │ (JSON)       │  │  (temp/)     │           │
+│  └──────────────┘  └──────────────┘  └──────────────┘           │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### 数据流向
+
+```
+用户消息 + 文件
+    │
+    ▼
+Router.process()
+    │
+    ├─> 1. 文件分析 (如有)
+    │   └─> 检查缓存 (路径 + mtime)
+    │       ├─ 命中: 使用缓存
+    │       └─ 未命中: 调用 analyze_file
+    │
+    ├─> 2. 组装上下文
+    │   └─> Assembler.assemble()
+    │       ├─ 工作记忆 (最近 5 轮)
+    │       ├─ 事实记忆 (车型、污染物等)
+    │       └─ 文件上下文 (如有)
+    │
+    ├─> 3. LLM 决策
+    │   └─> LLMClient.chat_with_tools()
+    │       ├─ System Prompt
+    │       ├─ 工具定义 (5 个工具)
+    │       ├─ 上下文消息
+    │       └─> 返回: 工具调用 或 直接回复
+    │
+    ├─> 4. 工具执行 (如有工具调用)
+    │   └─> Executor.execute()
+    │       ├─ 标准化参数 (车型、污染物)
+    │       ├─ 调用工具
+    │       └─> 返回: ToolResult
+    │
+    ├─> 5. 结果综合
+    │   └─> Router._synthesize()
+    │       ├─ 简化的 synthesis prompt (15 行)
+    │       ├─ 工具结果
+    │       └─> 返回: 自然语言回复
+    │
+    └─> 6. 更新记忆
+        └─> Memory.update()
+            ├─ 添加到工作记忆
+            ├─ 提取事实 (车型、污染物等)
+            └─ 缓存文件分析 (路径 + mtime)
 ```
 
 ---
 
-## 核心组件
+## 核心组件详解
 
-### 1. Agent Core (`agent/core.py`)
+### 1. UnifiedRouter (core/router.py)
 
-**职责**:
-- 理解用户意图
-- 规划任务执行
-- 协调 Skill 调用
-- 综合返回结果
+**职责**: 系统的核心协调器，处理所有用户请求
 
 **核心方法**:
 
 ```python
-class Agent:
-    def chat(self, message: str) -> str:
-        """主入口：处理用户消息"""
-
-    def _plan(self, message: str) -> List[SkillCall]:
-        """规划需要执行的 Skill"""
-
-    def _execute_skill(self, skill_call: SkillCall) -> SkillResult:
-        """执行单个 Skill"""
-
-    def _synthesize(self, results: List[SkillResult]) -> str:
-        """综合 Skill 结果生成回复"""
+class UnifiedRouter:
+    async def process(
+        self,
+        user_message: str,
+        file_path: Optional[str] = None
+    ) -> RouterResponse:
+        """
+        处理用户消息的主入口
+        
+        流程:
+        1. 分析文件 (如有) - 带 mtime 缓存
+        2. 组装上下文 - 工作记忆 + 事实记忆 + 文件
+        3. 调用 LLM - 生成工具调用或直接回复
+        4. 执行工具 - 标准化参数并调用
+        5. 综合结果 - 生成自然语言回复
+        6. 更新记忆 - 保存对话和事实
+        """
 ```
 
-**System Prompt 结构**:
+**关键特性**:
+
+1. **文件缓存 (mtime 检测)**
+   ```python
+   # 获取文件修改时间
+   current_mtime = os.path.getmtime(file_path_str)
+   
+   # 缓存有效条件: 路径和 mtime 都匹配
+   cache_valid = (
+       cached
+       and str(cached.get("file_path")) == file_path_str
+       and cached.get("file_mtime") == current_mtime
+   )
+   ```
+   
+   **为什么需要 mtime?**
+   - API 将同一会话的文件保存为 `{session_id}_input.csv`
+   - 新文件会覆盖旧文件，但路径相同
+   - 仅比较路径会导致使用过期缓存
+   - mtime 检测确保文件内容变化时重新分析
+
+2. **车型确认检查 (Python 规则)**
+   ```python
+   if tool_call.name == "calculate_micro_emission":
+       vehicle_type = tool_call.arguments.get("vehicle_type")
+       if vehicle_type:
+           # 检查用户消息中是否明确提到车型
+           user_msg = context.messages[-1].get("content", "").lower()
+           vehicle_keywords = ["小汽车", "轿车", "公交", "货车", ...]
+           has_vehicle_mention = any(kw in user_msg for kw in vehicle_keywords)
+           
+           if not has_vehicle_mention:
+               return RouterResponse(
+                   text="请先告诉我车辆类型..."
+               )
+   ```
+   
+   **为什么用 Python 规则而不是 Prompt?**
+   - 车型确认是关键业务逻辑，不能出错
+   - Python 规则更可靠、更快速
+   - 避免 prompt 膨胀
+
+3. **简化的 Synthesis Prompt (15 行)**
+   ```python
+   SYNTHESIS_PROMPT = """
+   你是排放计算助手。根据工具执行结果，生成自然、专业的回复。
+   
+   要求:
+   - 直接陈述结果，不要重复用户问题
+   - 使用中文，专业但易懂
+   - 如有图表或表格，简要说明即可
+   - 不要编造数据
+   """
+   ```
+   
+   **对比旧版 (76 行)**:
+   - 旧版: 详细的格式指导、示例、注意事项
+   - 新版: 核心要求，信任 LLM 理解
+   - 效果: 省 ~200 tokens/请求，响应更自然
+
+### 2. ContextAssembler (core/assembler.py)
+
+**职责**: 组装 LLM 所需的上下文信息
+
+**核心方法**:
+
+```python
+class ContextAssembler:
+    def assemble(
+        self,
+        user_message: str,
+        file_context: Optional[Dict] = None
+    ) -> AssembledContext:
+        """
+        组装完整上下文
+        
+        包含:
+        1. System Prompt (工具定义)
+        2. 工作记忆 (最近 5 轮对话)
+        3. 事实记忆 (车型、污染物、年份等)
+        4. 文件上下文 (如有)
+        5. 当前用户消息
+        """
 ```
-你是一个机动车排放计算助手。
 
-可用工具:
-- query_emission_factors: 查询排放因子
-- calculate_micro_emission: 微观排放计算
-- calculate_macro_emission: 宏观排放计算
-- search_knowledge: 知识检索
+**上下文结构**:
 
-工作流程:
-1. 理解用户意图
-2. 提取必要参数
-3. 调用相应工具
-4. 综合结果回复用户
+```python
+{
+    "messages": [
+        {
+            "role": "system",
+            "content": "你是排放计算助手...\n\n可用工具:\n- query_emission_factors\n- calculate_micro_emission\n- ..."
+        },
+        {
+            "role": "user",
+            "content": "[上下文] 最近使用的车型: 小汽车\n最近查询的污染物: CO2\n\n[当前消息] 查询 2020 年的排放因子"
+        }
+    ],
+    "tools": [...],  # 工具定义
+    "file_context": {...}  # 文件分析结果 (如有)
+}
 ```
 
-### 2. Context Manager (`agent/context.py`)
+**上下文优化**:
 
-**职责**:
-- 管理对话历史
-- 维护 Turn 状态
-- 压缩上下文
+1. **工作记忆**: 只保留最近 5 轮，避免 token 浪费
+2. **事实记忆**: 结构化提取，快速访问
+3. **文件上下文**: 只包含关键信息 (列名、行数、任务类型)
+
+### 3. ToolExecutor (core/executor.py)
+
+**职责**: 执行工具调用，透明地标准化参数
+
+**核心方法**:
+
+```python
+class ToolExecutor:
+    async def execute(
+        self,
+        tool_name: str,
+        arguments: Dict
+    ) -> ToolResult:
+        """
+        执行工具
+        
+        流程:
+        1. 标准化参数 (车型、污染物)
+        2. 获取工具实例
+        3. 调用工具
+        4. 返回结果
+        """
+```
+
+**透明标准化**:
+
+```python
+# LLM 看到的参数
+{
+    "vehicle_type": "小汽车",
+    "pollutant": "二氧化碳",
+    "model_year": 2020
+}
+
+# 标准化后传给工具的参数
+{
+    "vehicle_type": "Passenger Car",
+    "pollutant": "CO2",
+    "model_year": 2020
+}
+```
+
+**为什么透明?**
+- LLM 不需要知道标准化的存在
+- 用户可以用任何方式表达 (小汽车、轿车、passenger car)
+- 工具只接收标准化的参数
+
+### 4. MemoryManager (core/memory.py)
+
+**职责**: 管理三层记忆系统
 
 **数据结构**:
 
 ```python
+@dataclass
 class Turn:
     """单次对话轮次"""
-    user_input: str
-    assistant_response: str
-    skill_executions: List[SkillExecution]
-    chart_data: Optional[Dict]
-    table_data: Optional[Dict]
-    data_type: Optional[str]
-    timestamp: datetime
+    user: str
+    assistant: str
+    tool_calls: Optional[List[Dict]] = None
 
-class Context:
-    """对话上下文"""
-    turns: List[Turn]
-    session_id: str
-    metadata: Dict
+@dataclass
+class FactMemory:
+    """事实记忆 - 结构化信息"""
+    recent_vehicle: Optional[str] = None
+    recent_pollutants: List[str] = field(default_factory=list)
+    recent_year: Optional[int] = None
+    active_file: Optional[str] = None
+    file_analysis: Optional[Dict] = None  # 包含 file_path 和 file_mtime
 
-    def add_turn(self, turn: Turn):
-        """添加新的对话轮次"""
-
-    def get_summary(self) -> str:
-        """获取上下文摘要"""
-```
-
-**上下文压缩策略**:
-1. 保留最近 N 条完整对话
-2. 保留所有 Skill 执行结果
-3. 早期对话压缩为摘要
-4. 保留用户偏好设置
-
-### 3. Skill Registry (`skills/registry.py`)
-
-**职责**:
-- 注册所有可用 Skill
-- 提供 Skill 发现机制
-- 管理 Skill 依赖
-
-```python
-class SkillRegistry:
-    _skills: Dict[str, Skill] = {}
-
-    @classmethod
-    def register(cls, skill: Skill):
-        """注册 Skill"""
-
-    @classmethod
-    def get(cls, name: str) -> Skill:
-        """获取 Skill"""
-
-    @classmethod
-    def list_all(cls) -> List[str]:
-        """列出所有 Skill"""
-```
-
-### 4. Validator (`agent/validator.py`)
-
-**职责**:
-- 验证 Skill 参数
-- 检查数据完整性
-- 提供友好的错误提示
-
-```python
-class Validator:
-    def validate_emission_query(self, params: Dict) -> ValidationResult:
-        """验证排放查询参数"""
-
-    def validate_trajectory(self, data: List) -> ValidationResult:
-        """验证轨迹数据"""
-```
-
----
-
-## 工作流程
-
-### 完整请求处理流程
-
-```
-用户输入消息
-    │
-    ▼
-┌──────────────────────────────────────────────────────────────┐
-│ 1. 前端处理 (web/app.js)                                      │
-│    - 构建请求（message, session_id, file）                    │
-│    - 显示加载动画                                              │
-└──────────────────────────────────────────────────────────────┘
-    │
-    ▼ POST /chat
-┌──────────────────────────────────────────────────────────────┐
-│ 2. API 层 (api/routes.py)                                     │
-│    - 接收请求                                                  │
-│    - 处理文件上传                                              │
-│    - 获取/创建会话                                             │
-└──────────────────────────────────────────────────────────────┘
-    │
-    ▼ session.agent.chat(message)
-┌──────────────────────────────────────────────────────────────┐
-│ 3. Agent 层 (agent/core.py)                                   │
-│    3.1 创建新的 Turn                                          │
-│    3.2 规划：分析意图，提取参数                               │
-│    3.3 执行：调用相应 Skill                                   │
-│    3.4 综合：生成自然语言回复                                 │
-└──────────────────────────────────────────────────────────────┘
-    │
-    ├─▶ Skill: query_emission_factors
-│         │
-│         ▼
-│    ┌──────────────────────────────────────────────┐
-│    │ 4. Skill 执行                                │
-│    │    - 标准化参数（车型、污染物）               │
-│    │    - 查询 MOVES 数据                         │
-│    │    - 计算排放因子                            │
-│    └──────────────────────────────────────────────┘
-│         │
-│         ▼
-│    SkillResult { success: true, data: {...} }
-│
-├─▶ Skill: calculate_micro_emission
-│         │
-│         ▼
-│    ┌──────────────────────────────────────────────┐
-│    │ 4. Skill 执行                                │
-│    │    - 解析上传文件                            │
-│    │    - 智能列名映射                            │
-│    │    - 验证数据完整性                          │
-│    │    - 询问缺失参数（车型）                    │
-│    │    - 计算 VSP 和排放                         │
-│    │    - 生成结果文件                            │
-│    └──────────────────────────────────────────────┘
-│         │
-│         ▼
-│    SkillResult { success: true, data: {...} }
-│
-    │
-    ▼
-┌──────────────────────────────────────────────────────────────┐
-│ 5. 上下文保存                                                  │
-│    - 更新 Turn（skill_executions, 结果）                      │
-│    - 压缩历史对话                                              │
-│    - 保存到 SessionManager                                     │
-└──────────────────────────────────────────────────────────────┘
-    │
-    ▼
-┌──────────────────────────────────────────────────────────────┐
-│ 6. 响应构建                                                    │
-│    - 提取当前 turn 的图表/表格数据                            │
-│    - 构建 ChatResponse                                        │
-│    - 清理回复文本（移除 JSON 等）                             │
-└──────────────────────────────────────────────────────────────┘
-    │
-    ▼ JSON Response
-┌──────────────────────────────────────────────────────────────┐
-│ 7. 前端渲染                                                    │
-│    - 移除加载动画                                              │
-│    - 显示 Markdown 回复                                        │
-│    - 渲染图表/表格                                            │
-│    - 更新会话列表                                              │
-└──────────────────────────────────────────────────────────────┘
-```
-
-### 多轮对话示例
-
-```
-User: "查询2020年小汽车的CO2排放因子"
-      │
-      ▼
-Agent: [执行 query_emission_factors]
-      返回图表 + "2020年小汽车的CO2排放因子如下..."
-
-User: "那公交车呢？"
-      │
-      ▼
-Agent: [上下文理解：延续上一个查询]
-      [保持参数：pollutant=CO2, year=2020]
-      [更新参数：vehicle_type=公交车]
-      [执行 query_emission_factors]
-      返回图表 + "2020年公交车的CO2排放因子如下..."
-```
-
----
-
-## 数据流
-
-### 1. 排放因子查询数据流
-
-```
-用户输入
-    │
-    ▼
-Agent: 提取参数
-    │
-    ├─ vehicle_type → 标准化器 → "Passenger Car"
-    ├─ pollutant → 标准化器 → "CO2"
-    └─ model_year → 验证器 → 2020
-    │
-    ▼
-Skill: query_emission_factors
-    │
-    ├─ 读取 MOVES Matrix
-    │  └─ atlanta_2025_1_55_65.csv
-    │
-    ├─ 插值计算
-    │  └─ 生成 speed-emission 曲线
-    │
-    └─ 提取关键点
-       └─ 30/60/90 km/h 排放值
-    │
-    ▼
-返回数据结构:
-{
-  "speed_curve": [
-    {"speed_kph": 5, "emission_rate": 180.5},
-    {"speed_kph": 10, "emission_rate": 165.2},
-    ...
-  ],
-  "query_summary": {
-    "vehicle_type": "小汽车",
-    "pollutant": "CO2",
-    "model_year": 2020
-  },
-  "unit": "g/mile",
-  "data_points": 73
-}
-    │
-    ▼
-前端: 渲染 ECharts 折线图
-```
-
-### 2. 微观排放计算数据流
-
-```
-用户上传文件
-    │
-    ▼
-文件分析 (file_analyzer.py)
-    │
-    ├─ 读取文件结构
-    │  └─ columns, sample_data, row_count
-    │
-    └─ 智能列名映射
-       ├─ LLM 理解列名
-       ├─ 生成映射关系
-       └─ 应用映射
-    │
-    ▼
-ExcelHandler (micro_emission/excel_handler.py)
-    │
-    ├─ 读取并验证数据
-    │  └─ 检查必需列
-    │
-    ├─ 数据预处理
-    │  ├─ 计算加速度（如缺失）
-    │  ├─ 填充坡度（默认0%）
-    │  └─ 单位转换
-    │
-    └─ 参数验证
-       └─ 检查车型是否指定
-    │
-    ▼
-Calculator (micro_emission/calculator.py)
-    │
-    ├─ VSP 计算
-    │  └─ vsp = v * (1.1 * a + 9.81 * grade + 0.132) + 0.000302 * v^3
-    │
-    ├─ VSP Bin 分配
-    │  └─ 将 VSP 分类到 20 个 Bin
-    │
-    └─ 排放计算
-       ├─ 查找每个 Bin 的排放率
-       └─ 逐秒累加排放
-    │
-    ▼
-输出结果
-    │
-    ├─ Excel 文件
-    │  └─ 逐秒排放明细
-    │
-    └─ 汇总数据
-       ├─ 总排放量
-       ├─ 排放率统计
-       └─ 图表数据
-    │
-    ▼
-前端: 渲染结果表格
-```
-
----
-
-## Agent-Skill 架构
-
-### 设计原则
-
-| 层级 | 职责 | 特点 |
-|------|------|------|
-| **Agent** | 意图理解、任务规划、结果综合 | 轻量、通用、可组合 |
-| **Skill** | 领域知识、计算逻辑、数据处理 | 重量、专用、独立 |
-
-### 接口定义
-
-```python
-class Skill(ABC):
-    """Skill 基类"""
-
-    @property
-    @abstractmethod
-    def name(self) -> str:
-        """Skill 名称"""
-
-    @property
-    @abstractmethod
-    def description(self) -> str:
-        """Skill 描述（用于 Agent 理解）"""
-
-    @property
-    @abstractmethod
-    def parameters(self) -> Dict[str, ParameterSchema]:
-        """参数定义"""
-
-    @abstractmethod
-    def execute(self, **kwargs) -> SkillResult:
-        """执行 Skill"""
-
-    def get_missing_params(self, provided: Dict) -> List[str]:
-        """检查缺失的必需参数"""
-```
-
-### Skill 示例
-
-```python
-class QueryEmissionFactorsSkill(Skill):
-    name = "query_emission_factors"
-    description = "查询MOVES数据库中的排放因子速度曲线"
-
-    parameters = {
-        "vehicle_type": {
-            "type": "string",
-            "required": True,
-            "description": "车型（如小汽车、公交车）"
-        },
-        "pollutant": {
-            "type": "string",
-            "required": True,
-            "description": "污染物（如CO2、NOx）"
-        },
-        "model_year": {
-            "type": "integer",
-            "required": True,
-            "description": "年份（1995-2025）"
-        }
-    }
-
-    def execute(self, **kwargs) -> SkillResult:
-        # 1. 标准化参数
-        vehicle = self.standardizer.standardize_vehicle(
-            kwargs["vehicle_type"]
-        )
-
-        # 2. 查询数据
-        data = self.calculator.query(
-            vehicle_type=vehicle,
-            pollutant=kwargs["pollutant"],
-            year=kwargs["model_year"]
-        )
-
-        # 3. 返回结果
-        return SkillResult(
-            success=True,
-            data=data
-        )
-```
-
-### Agent 如何使用 Skill
-
-```python
-class Agent:
+class MemoryManager:
     def __init__(self):
-        self.skill_registry = SkillRegistry()
-        self._register_skills()
+        self.working_memory: List[Turn] = []  # 最近 5 轮
+        self.fact_memory: FactMemory = FactMemory()
+        self.compressed_memory: str = ""  # 早期对话摘要
+```
 
-    def _plan(self, message: str) -> List[SkillCall]:
-        """使用 LLM 规划需要执行的 Skill"""
-        available_skills = self.skill_registry.list_all()
+**记忆更新**:
 
-        prompt = f"""
-        用户消息: {message}
+```python
+def update(
+    self,
+    user_message: str,
+    assistant_response: str,
+    tool_calls: Optional[List[Dict]] = None,
+    file_path: Optional[str] = None,
+    file_analysis: Optional[Dict] = None
+):
+    # 1. 添加到工作记忆
+    turn = Turn(user=user_message, assistant=assistant_response, tool_calls=tool_calls)
+    self.working_memory.append(turn)
+    
+    # 2. 提取事实
+    if tool_calls:
+        self._extract_facts_from_tool_calls(tool_calls)
+    
+    # 3. 缓存文件分析 (包含 mtime)
+    if file_path and file_analysis:
+        self.fact_memory.active_file = str(file_path)
+        self.fact_memory.file_analysis = file_analysis  # 包含 file_mtime
+    
+    # 4. 保持工作记忆大小
+    if len(self.working_memory) > 5:
+        self.working_memory = self.working_memory[-5:]
+```
 
-        可用工具: {available_skills}
+**事实提取**:
 
-        请分析需要调用哪些工具，以及每个工具的参数。
-        返回 JSON 格式。
+```python
+def _extract_facts_from_tool_calls(self, tool_calls: List[Dict]):
+    """从工具调用中提取事实"""
+    for tc in tool_calls:
+        args = tc.get("arguments", {})
+        
+        # 提取车型
+        if "vehicle_type" in args:
+            self.fact_memory.recent_vehicle = args["vehicle_type"]
+        
+        # 提取污染物
+        if "pollutants" in args:
+            self.fact_memory.recent_pollutants = args["pollutants"]
+        elif "pollutant" in args:
+            self.fact_memory.recent_pollutants = [args["pollutant"]]
+        
+        # 提取年份
+        if "model_year" in args:
+            self.fact_memory.recent_year = args["model_year"]
+```
+
+---
+
+## 完整工作流程
+
+### 场景 1: 排放因子查询 (无文件)
+
+```
+用户: "查询 2020 年小汽车的 CO2 排放因子"
+    │
+    ▼
+Router.process(user_message="查询 2020 年小汽车的 CO2 排放因子", file_path=None)
+    │
+    ├─> 1. 文件分析: 跳过 (无文件)
+    │
+    ├─> 2. 组装上下文
+    │   Assembler.assemble()
+    │   └─> messages = [
+    │           {"role": "system", "content": "你是排放计算助手..."},
+    │           {"role": "user", "content": "查询 2020 年小汽车的 CO2 排放因子"}
+    │       ]
+    │
+    ├─> 3. LLM 决策
+    │   LLMClient.chat_with_tools(messages, tools)
+    │   └─> 返回: ToolCall(
+    │           name="query_emission_factors",
+    │           arguments={
+    │               "vehicle_type": "小汽车",
+    │               "pollutant": "CO2",
+    │               "model_year": 2020
+    │           }
+    │       )
+    │
+    ├─> 4. 执行工具
+    │   Executor.execute("query_emission_factors", {...})
+    │   │
+    │   ├─> 4.1 标准化参数
+    │   │   Standardizer.standardize_vehicle("小汽车") → "Passenger Car"
+    │   │   Standardizer.standardize_pollutant("CO2") → "CO2"
+    │   │
+    │   ├─> 4.2 调用工具
+    │   │   QueryEmissionFactorsTool.execute(
+    │   │       vehicle_type="Passenger Car",
+    │   │       pollutant="CO2",
+    │   │       model_year=2020
+    │   │   )
+    │   │   │
+    │   │   └─> Calculator.query_emission_factors()
+    │   │       ├─ 读取 MOVES 数据
+    │   │       ├─ 插值计算速度曲线
+    │   │       └─ 返回: {
+    │   │             "speed_curve": [...],
+    │   │             "key_points": {...}
+    │   │           }
+    │   │
+    │   └─> 返回: ToolResult(
+    │           success=True,
+    │           data={...},
+    │           summary="查询成功"
+    │       )
+    │
+    ├─> 5. 综合结果
+    │   Router._synthesize(tool_results)
+    │   └─> LLM 生成自然语言回复:
+    │       "2020 年小汽车的 CO2 排放因子曲线如下..."
+    │
+    └─> 6. 更新记忆
+        Memory.update(
+            user_message="查询 2020 年小汽车的 CO2 排放因子",
+            assistant_response="2020 年小汽车的 CO2 排放因子曲线如下...",
+            tool_calls=[{
+                "name": "query_emission_factors",
+                "arguments": {"vehicle_type": "小汽车", "pollutant": "CO2", ...}
+            }]
+        )
+        ├─> 工作记忆: 添加本轮对话
+        └─> 事实记忆: recent_vehicle="小汽车", recent_pollutants=["CO2"], recent_year=2020
+```
+
+### 场景 2: 微观排放计算 (有文件)
+
+```
+用户: 上传 trajectory.csv + "计算这个轨迹的排放"
+    │
+    ▼
+Router.process(user_message="计算这个轨迹的排放", file_path="/tmp/xxx_input.csv")
+    │
+    ├─> 1. 文件分析 (带 mtime 缓存)
+    │   │
+    │   ├─> 检查缓存
+    │   │   current_mtime = os.path.getmtime("/tmp/xxx_input.csv")  # 1771663362.52
+    │   │   cached = memory.get_fact_memory().get("file_analysis")
+    │   │   
+    │   │   if cached and cached["file_path"] == "/tmp/xxx_input.csv" and cached["file_mtime"] == current_mtime:
+    │   │       使用缓存
+    │   │   else:
+    │   │       重新分析
+    │   │
+    │   └─> FileAnalyzer.analyze_file("/tmp/xxx_input.csv")
+    │       ├─ 读取文件结构 (列名、行数)
+    │       ├─ 读取示例数据 (前 3 行)
+    │       ├─ 智能识别任务类型: "micro_emission"
+    │       └─ 返回: {
+    │             "file_path": "/tmp/xxx_input.csv",
+    │             "file_mtime": 1771663362.52,
+    │             "columns": ["time", "speed_kph", "acceleration", "grade"],
+    │             "row_count": 1000,
+    │             "file_task_type": "micro_emission"
+    │           }
+    │
+    ├─> 2. 组装上下文
+    │   Assembler.assemble(user_message, file_context)
+    │   └─> messages = [
+    │           {"role": "system", "content": "你是排放计算助手..."},
+    │           {"role": "user", "content": 
+    │               "[文件上传] 文件路径: /tmp/xxx_input.csv\n" +
+    │               "文件类型: 微观排放轨迹数据\n" +
+    │               "列名: time, speed_kph, acceleration, grade\n" +
+    │               "行数: 1000\n\n" +
+    │               "[用户消息] 计算这个轨迹的排放"
+    │           }
+    │       ]
+    │
+    ├─> 3. LLM 决策
+    │   LLMClient.chat_with_tools(messages, tools)
+    │   └─> 返回: ToolCall(
+    │           name="calculate_micro_emission",
+    │           arguments={
+    │               "file_path": "/tmp/xxx_input.csv",
+    │               "vehicle_type": "小汽车",  # LLM 可能从上下文推断
+    │               "model_year": 2020,
+    │               "pollutants": ["CO2", "NOx"]
+    │           }
+    │       )
+    │
+    ├─> 4. 车型确认检查 (Python 规则)
+    │   if tool_call.name == "calculate_micro_emission":
+    │       vehicle_type = "小汽车"
+    │       user_msg = "计算这个轨迹的排放"
+    │       
+    │       # 检查用户消息中是否提到车型
+    │       has_vehicle_mention = any(kw in user_msg for kw in ["小汽车", "轿车", ...])
+    │       
+    │       if not has_vehicle_mention:
+    │           return RouterResponse(text="请先告诉我车辆类型...")
+    │
+    ├─> 5. 执行工具 (如果通过车型检查)
+    │   Executor.execute("calculate_micro_emission", {...})
+    │   │
+    │   ├─> 5.1 标准化参数
+    │   │   vehicle_type: "小汽车" → "Passenger Car"
+    │   │   pollutants: ["CO2", "NOx"] → ["CO2", "NOx"]
+    │   │
+    │   ├─> 5.2 调用工具
+    │   │   MicroEmissionTool.execute(
+    │   │       file_path="/tmp/xxx_input.csv",
+    │   │       vehicle_type="Passenger Car",
+    │   │       model_year=2020,
+    │   │       pollutants=["CO2", "NOx"]
+    │   │   )
+    │   │   │
+    │   │   ├─> 读取轨迹数据
+    │   │   ├─> 计算 VSP
+    │   │   ├─> 计算排放
+    │   │   ├─> 生成结果 Excel
+    │   │   └─> 返回: {
+    │   │         "total_emissions": {...},
+    │   │         "download_file": "/tmp/xxx_output.xlsx"
+    │   │       }
+    │   │
+    │   └─> 返回: ToolResult(success=True, data={...})
+    │
+    ├─> 6. 综合结果
+    │   Router._synthesize(tool_results)
+    │   └─> "计算完成，总排放量: CO2 1234.5g, NOx 56.7g"
+    │
+    └─> 7. 更新记忆
+        Memory.update(
+            user_message="计算这个轨迹的排放",
+            assistant_response="计算完成...",
+            tool_calls=[...],
+            file_path="/tmp/xxx_input.csv",
+            file_analysis={
+                "file_path": "/tmp/xxx_input.csv",
+                "file_mtime": 1771663362.52,  # 关键: 保存 mtime
+                ...
+            }
+        )
+```
+
+### 场景 3: 多轮对话 (上下文延续)
+
+```
+第 1 轮:
+用户: "查询 2020 年小汽车的 CO2 排放因子"
+助手: "2020 年小汽车的 CO2 排放因子曲线如下..."
+    └─> 记忆更新: recent_vehicle="小汽车", recent_pollutants=["CO2"], recent_year=2020
+
+第 2 轮:
+用户: "那公交车呢？"
+    │
+    ▼
+Router.process(user_message="那公交车呢？", file_path=None)
+    │
+    ├─> 1. 组装上下文 (包含事实记忆)
+    │   Assembler.assemble()
+    │   └─> messages = [
+    │           {"role": "system", "content": "..."},
+    │           {"role": "user", "content": 
+    │               "[上下文] 最近使用的车型: 小汽车\n" +
+    │               "最近查询的污染物: CO2\n" +
+    │               "最近查询的年份: 2020\n\n" +
+    │               "[当前消息] 那公交车呢？"
+    │           }
+    │       ]
+    │
+    ├─> 2. LLM 决策 (理解上下文)
+    │   LLMClient.chat_with_tools(messages, tools)
+    │   └─> LLM 理解: 用户想查询公交车的 CO2 排放因子 (2020 年)
+    │       返回: ToolCall(
+    │           name="query_emission_factors",
+    │           arguments={
+    │               "vehicle_type": "公交车",
+    │               "pollutant": "CO2",  # 从上下文继承
+    │               "model_year": 2020   # 从上下文继承
+    │           }
+    │       )
+    │
+    └─> 3. 执行工具并返回结果
+        "2020 年公交车的 CO2 排放因子曲线如下..."
+```
+
+### 场景 4: 文件覆盖场景 (mtime 检测)
+
+```
+第 1 轮: 上传 micro_trajectory.csv
+    │
+    ├─> 文件分析
+    │   file_path = "/tmp/session123_input.csv"
+    │   file_mtime = 1771663362.52
+    │   file_task_type = "micro_emission"
+    │   
+    │   缓存: {
+    │       "file_path": "/tmp/session123_input.csv",
+    │       "file_mtime": 1771663362.52,
+    │       "file_task_type": "micro_emission"
+    │   }
+    │
+    └─> 执行 calculate_micro_emission
+
+第 2 轮: 上传 macro_network.csv (覆盖同一文件)
+    │
+    ├─> 文件分析
+    │   file_path = "/tmp/session123_input.csv"  # 路径相同!
+    │   file_mtime = 1771663400.15  # mtime 不同!
+    │   
+    │   检查缓存:
+    │   cached["file_path"] == file_path  ✓
+    │   cached["file_mtime"] == file_mtime  ✗  (1771663362.52 != 1771663400.15)
+    │   
+    │   缓存失效，重新分析:
+    │   file_task_type = "macro_emission"  # 正确识别为宏观数据
+    │   
+    │   更新缓存: {
+    │       "file_path": "/tmp/session123_input.csv",
+    │       "file_mtime": 1771663400.15,  # 新的 mtime
+    │       "file_task_type": "macro_emission"
+    │   }
+    │
+    └─> 执行 calculate_macro_emission  # 正确的工具!
+```
+
+**如果没有 mtime 检测会怎样?**
+```
+第 2 轮: 上传 macro_network.csv
+    │
+    ├─> 文件分析
+    │   file_path = "/tmp/session123_input.csv"
+    │   
+    │   检查缓存:
+    │   cached["file_path"] == file_path  ✓
+    │   
+    │   使用缓存 (错误!):
+    │   file_task_type = "micro_emission"  # 错误! 应该是 macro_emission
+    │
+    └─> LLM 调用 calculate_micro_emission  # 错误的工具!
+        └─> 触发车型确认检查 (不应该出现)
+```
+
+---
+
+## 三层记忆系统
+
+### 设计目标
+
+1. **高效**: 避免发送过多历史对话消耗 token
+2. **准确**: 保留关键信息用于上下文理解
+3. **灵活**: 支持长对话而不丢失重要信息
+
+### 三层结构
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    Working Memory (工作记忆)                  │
+│  ┌────────────────────────────────────────────────────────┐ │
+│  │  最近 5 轮完整对话                                       │ │
+│  │  ├─ Turn 1: user + assistant + tool_calls              │ │
+│  │  ├─ Turn 2: user + assistant + tool_calls              │ │
+│  │  ├─ Turn 3: user + assistant + tool_calls              │ │
+│  │  ├─ Turn 4: user + assistant + tool_calls              │ │
+│  │  └─ Turn 5: user + assistant + tool_calls              │ │
+│  └────────────────────────────────────────────────────────┘ │
+│  特点: 完整保留，用于理解最近的对话上下文                      │
+└─────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────┐
+│                     Fact Memory (事实记忆)                    │
+│  ┌────────────────────────────────────────────────────────┐ │
+│  │  结构化的关键信息                                         │ │
+│  │  ├─ recent_vehicle: "小汽车"                            │ │
+│  │  ├─ recent_pollutants: ["CO2", "NOx"]                  │ │
+│  │  ├─ recent_year: 2020                                  │ │
+│  │  ├─ active_file: "/tmp/xxx_input.csv"                  │ │
+│  │  └─ file_analysis: {                                   │ │
+│  │        "file_path": "/tmp/xxx_input.csv",              │ │
+│  │        "file_mtime": 1771663362.52,                    │ │
+│  │        "file_task_type": "micro_emission"              │ │
+│  │     }                                                   │ │
+│  └────────────────────────────────────────────────────────┘ │
+│  特点: 快速访问，用于参数继承和上下文补全                      │
+└─────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────┐
+│                 Compressed Memory (压缩记忆)                  │
+│  ┌────────────────────────────────────────────────────────┐ │
+│  │  早期对话的摘要 (预留功能)                               │ │
+│  │  "用户在前面的对话中查询了多种车型的排放因子..."          │ │
+│  └────────────────────────────────────────────────────────┘ │
+│  特点: 节省 token，保留长期上下文                             │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### 记忆流转
+
+```
+新对话轮次
+    │
+    ▼
+添加到 Working Memory
+    │
+    ├─> 如果 Working Memory > 5 轮
+    │   └─> 最旧的 1 轮移除 (或压缩到 Compressed Memory)
+    │
+    └─> 提取事实到 Fact Memory
+        ├─ 从 tool_calls 提取车型、污染物、年份
+        ├─ 更新 active_file
+        └─ 缓存 file_analysis (包含 mtime)
+```
+
+### 上下文组装示例
+
+```python
+def assemble_context(self, user_message: str, file_context: Optional[Dict]) -> str:
+    """组装发送给 LLM 的上下文"""
+    
+    parts = []
+    
+    # 1. 事实记忆 (如果有)
+    fact_memory = self.memory.get_fact_memory()
+    if fact_memory.get("recent_vehicle"):
+        parts.append(f"[上下文] 最近使用的车型: {fact_memory['recent_vehicle']}")
+    if fact_memory.get("recent_pollutants"):
+        parts.append(f"最近查询的污染物: {', '.join(fact_memory['recent_pollutants'])}")
+    if fact_memory.get("recent_year"):
+        parts.append(f"最近查询的年份: {fact_memory['recent_year']}")
+    
+    # 2. 文件上下文 (如果有)
+    if file_context:
+        parts.append(f"\n[文件上传] 文件路径: {file_context['file_path']}")
+        parts.append(f"文件类型: {file_context['file_task_type']}")
+        parts.append(f"列名: {', '.join(file_context['columns'])}")
+        parts.append(f"行数: {file_context['row_count']}")
+    
+    # 3. 当前消息
+    parts.append(f"\n[当前消息] {user_message}")
+    
+    return "\n".join(parts)
+```
+
+---
+
+## 文件处理与缓存
+
+### 文件分析流程
+
+```python
+# tools/file_analyzer.py
+
+class FileAnalyzer:
+    async def analyze_file(self, file_path: str) -> Dict:
         """
-
-        response = self.llm.call(prompt)
-        return self._parse_skill_plan(response)
-
-    def _execute_skill(self, skill_call: SkillCall) -> SkillResult:
-        """执行单个 Skill"""
-        skill = self.skill_registry.get(skill_call.skill_name)
-        return skill.execute(**skill_call.parameters)
+        分析上传的文件
+        
+        返回:
+        {
+            "file_path": str,
+            "file_mtime": float,  # 文件修改时间
+            "columns": List[str],
+            "row_count": int,
+            "sample_data": List[Dict],
+            "file_task_type": str  # "micro_emission" 或 "macro_emission"
+        }
+        """
+        
+        # 1. 读取文件基本信息
+        df = pd.read_excel(file_path) if file_path.endswith('.xlsx') else pd.read_csv(file_path)
+        
+        # 2. 提取结构信息
+        columns = list(df.columns)
+        row_count = len(df)
+        sample_data = df.head(3).to_dict(orient="records")
+        
+        # 3. 智能识别任务类型
+        task_type = self._identify_task_type(columns, sample_data)
+        
+        return {
+            "file_path": str(file_path),
+            "file_mtime": os.path.getmtime(file_path),  # 关键: 记录 mtime
+            "columns": columns,
+            "row_count": row_count,
+            "sample_data": sample_data,
+            "file_task_type": task_type
+        }
+    
+    def _identify_task_type(self, columns: List[str], sample_data: List[Dict]) -> str:
+        """
+        识别文件任务类型
+        
+        微观排放特征:
+        - 有 time/speed/acceleration 等列
+        - 数据是逐秒的轨迹点
+        
+        宏观排放特征:
+        - 有 link_id/length/flow/avg_speed 等列
+        - 有车队组成列 (Passenger Car, Bus, Truck 等)
+        """
+        columns_lower = [c.lower() for c in columns]
+        
+        # 检查微观排放特征
+        micro_keywords = ["time", "speed", "acceleration", "grade", "trajectory"]
+        has_micro = sum(1 for kw in micro_keywords if any(kw in col for col in columns_lower))
+        
+        # 检查宏观排放特征
+        macro_keywords = ["link", "flow", "fleet", "passenger car", "bus", "truck"]
+        has_macro = sum(1 for kw in macro_keywords if any(kw in col for col in columns_lower))
+        
+        if has_micro > has_macro:
+            return "micro_emission"
+        else:
+            return "macro_emission"
 ```
 
----
+### 缓存机制
 
-## 上下文管理
+**问题**: 同一会话上传多个文件时，API 将文件保存为 `{session_id}_input.csv`，新文件会覆盖旧文件
 
-### Context 数据结构
+**解决方案**: 使用文件修改时间 (mtime) 检测文件是否变化
 
 ```python
-class Context:
-    """对话上下文管理器"""
+# core/router.py
 
-    def __init__(self, session_id: str):
-        self.session_id = session_id
-        self.turns: List[Turn] = []
-        self.max_turns = 50  # 最多保留轮次
-        self.compress_threshold = 10  # 超过此数量开始压缩
+async def process(self, user_message: str, file_path: Optional[str] = None):
+    file_context = None
+    if file_path:
+        from pathlib import Path
+        import os
 
-    def add_turn(self, turn: Turn):
-        """添加新的对话轮次"""
-        self.turns.append(turn)
+        cached = self.memory.get_fact_memory().get("file_analysis")
+        file_path_str = str(file_path)
 
-        # 压缩旧对话
-        if len(self.turns) > self.compress_threshold:
-            self._compress_old_turns()
+        # 获取当前文件的 mtime
+        try:
+            current_mtime = os.path.getmtime(file_path_str)
+        except Exception:
+            current_mtime = None
 
-    def _compress_old_turns(self):
-        """压缩旧对话为摘要"""
-        keep_recent = 5  # 保留最近5轮完整对话
-        old_turns = self.turns[:-keep_recent]
+        # 缓存有效条件: 路径和 mtime 都匹配
+        cache_valid = (
+            cached
+            and str(cached.get("file_path")) == file_path_str
+            and cached.get("file_mtime") == current_mtime
+        )
 
-        # 生成摘要
-        summary = self._generate_summary(old_turns)
-
-        # 替换为摘要
-        self.turns = [
-            Turn(
-                user_input="[历史对话摘要]",
-                assistant_response=summary,
-                skill_executions=[],  # 不保留旧执行详情
-                timestamp=old_turns[0].timestamp
-            )
-        ] + self.turns[-keep_recent:]
-
-    def get_relevant_context(self, current_turn: Turn) -> str:
-        """获取与当前对话相关的上下文"""
-        context_parts = []
-
-        # 添加最近的对话
-        for turn in self.turns[-3:]:
-            context_parts.append(f"用户: {turn.user_input}")
-            context_parts.append(f"助手: {turn.assistant_response}")
-
-        # 添加最近的 Skill 执行结果
-        for turn in self.turns[-3:]:
-            if turn.skill_executions:
-                for execution in turn.skill_executions:
-                    if execution.success:
-                        context_parts.append(
-                            f"之前执行了 {execution.skill_name}，"
-                            f"参数: {execution.parameters}"
-                        )
-
-        return "\n".join(context_parts)
+        if cache_valid:
+            file_context = cached
+            logger.info(f"Using cached file analysis for {file_path}")
+        else:
+            # 重新分析文件
+            file_context = await self._analyze_file(file_path)
+            file_context["file_path"] = file_path_str
+            file_context["file_mtime"] = current_mtime
+            logger.info(f"Analyzed new file: {file_path} (mtime: {current_mtime})")
 ```
 
-### Turn 生命周期
+**缓存失效场景**:
 
-```
-创建 Turn
-    │
-    ├─ user_input: 用户消息
-    ├─ timestamp: 时间戳
-    └─ skill_executions: [] (初始为空)
-    │
-    ▼
-执行 Skill
-    │
-    ├─ 记录 SkillExecution
-    │  ├─ skill_name
-    │  ├─ parameters
-    │  ├─ result
-    │  └─ success
-    │
-    └─ 更新 skill_executions
-    │
-    ▼
-生成回复
-    │
-    ├─ assistant_response: 自然语言回复
-    ├─ chart_data: 图表数据 (如果有)
-    └─ table_data: 表格数据 (如果有)
-    │
-    ▼
-保存到 Context
-    │
-    └─ context.add_turn(turn)
-    │
-    ▼
-上下文压缩 (如果需要)
-    │
-    └─ 旧对话 → 摘要
-```
+1. **文件路径不同**: 新会话或不同文件名
+2. **文件 mtime 不同**: 同一路径但文件被覆盖
+3. **缓存不存在**: 首次上传文件
 
----
+**缓存命中场景**:
 
-## 智能列名映射
+1. **追问场景**: 用户上传文件后，在同一会话中追问
+2. **路径和 mtime 都匹配**: 文件未被修改
 
-### 问题背景
+### 文件存储策略
 
-用户上传的 Excel 文件列名千变万化：
-- `speed_kph`, `Speed`, `速度`, `车速`
-- `acceleration`, `acc`, `加速度`
-- `length`, `link_length`, `路段长度`
-
-硬编码所有变体是不可能的。
-
-### 解决方案：LLM 映射
-
-```python
-# skills/common/column_mapper.py
-
-def map_columns_with_llm(file_info: Dict, task_type: str, llm_client) -> Dict:
-    """使用 LLM 进行列名映射"""
-
-    prompt = f"""
-    文件信息:
-    - 列名: {file_info['columns']}
-    - 示例数据: {file_info['sample_data'][:2]}
-
-    任务类型: {task_type}
-
-    标准字段定义:
-    {FIELD_DEFINITIONS[task_type]}
-
-    请分析用户列名，将每个用户列映射到对应的标准字段。
-    只返回映射关系的 JSON，不要解释。
-
-    返回格式:
-    {{
-        "mapping": {{
-            "用户列名": "标准字段名",
-            ...
-        }},
-        "unmapped_columns": ["未映射的列"],
-        "confidence": 0.95
-    }}
-    """
-
-    response = llm_client.call(prompt)
-    return json.loads(response)
-```
-
-### 字段定义
-
-```python
-FIELD_DEFINITIONS = {
-    "micro_emission": {
-        "time": {"description": "时间（秒）", "examples": ["t", "time", "时间", "timestamp"]},
-        "speed": {"description": "速度（km/h）", "examples": ["speed_kph", "speed", "速度", "车速"]},
-        "acceleration": {"description": "加速度（m/s²）", "examples": ["acceleration", "acc", "加速度"]},
-        "grade": {"description": "坡度（%）", "examples": ["grade", "slope", "坡度", "gradient"]}
-    },
-    "macro_emission": {
-        "link_id": {"description": "路段ID", "examples": ["link_id", "id", "路段ID"]},
-        "length": {"description": "路段长度（km）", "examples": ["length", "link_length", "长度"]},
-        "flow": {"description": "交通流量（辆/小时）", "examples": ["flow", "traffic_flow", "流量"]},
-        "avg_speed": {"description": "平均速度（km/h）", "examples": ["avg_speed", "speed", "速度"]},
-        # ... 车队组成字段（13种MOVES车型）
-    }
-}
-```
-
-### 执行流程
-
-```
-上传文件
-    │
-    ▼
-analyze_file_structure()
-    │
-    ├─ 读取列名
-    ├─ 读取示例数据（前3行）
-    └─ 返回: {columns, sample_data, row_count}
-    │
-    ▼
-map_columns_with_llm()
-    │
-    ├─ 构建 Prompt（列名 + 示例 + 字段定义）
-    ├─ 调用 LLM
-    └─ 返回映射关系
-    │
-    ▼
-apply_column_mapping(df, mapping)
-    │
-    └─ 重命名 DataFrame 列
-    │
-    ▼
-验证映射结果
-    │
-    ├─ 检查必需列是否存在
-    ├─ 检查数据类型是否正确
-    └─ 失败则回退到硬编码匹配
-    │
-    ▼
-返回映射后的数据
-```
-
-### 回退机制
-
-```python
-# 如果 LLM 映射失败，使用硬编码匹配
-
-FALLBACK_MAPPING = {
-    "micro_emission": {
-        "time": ["t", "time", "时间", "timestamp"],
-        "speed": ["speed_kph", "speed", "velocity", "速度", "车速"],
-        "acceleration": ["acceleration", "acc", "accel", "加速度"],
-        "grade": ["grade", "slope", "gradient", "坡度", "grade_pct"]
-    }
-}
-
-def find_column_fallback(df: pd.DataFrame, target_field: str) -> Optional[str]:
-    """使用模糊匹配查找列"""
-    candidates = FALLBACK_MAPPING[task_type][target_field]
-    for col in df.columns:
-        if col.lower() in [c.lower() for c in candidates]:
-            return col
-    return None
-```
-
----
-
-## Web 架构
-
-### 技术栈
-
-| 层级 | 技术 | 用途 |
-|------|------|------|
-| 后端 | FastAPI | Web 框架 |
-| 后端 | Uvicorn | ASGI 服务器 |
-| 前端 | Vanilla JS | 客户端逻辑 |
-| 前端 | Tailwind CSS | 样式 |
-| 前端 | ECharts | 图表渲染 |
-| 前端 | Marked.js | Markdown 渲染 |
-
-### API 端点
-
-```
-POST /chat
-    - 发送消息
-    - 上传文件
-    - 获取回复
-
-GET  /sessions
-    - 获取会话列表
-
-POST /sessions/new
-    - 创建新会话
-
-GET  /sessions/{id}/history
-    - 获取会话历史
-
-DELETE /sessions/{id}
-    - 删除会话
-
-POST /file/preview
-    - 预览上传文件
-
-GET  /file/download/{file_id}
-    - 下载结果文件
-
-GET  /file/template/{template_type}
-    - 下载模板文件
-```
-
-### 前端状态管理
-
-```javascript
-// web/app.js
-
-const state = {
-    currentSessionId: null,
-    isProcessing: false,
-    uploadedFile: null,
-    messages: []
-};
-
-// 消息处理
-async function sendMessage() {
-    // 1. 收集输入
-    const message = messageInput.value;
-    const file = state.uploadedFile;
-
-    // 2. 显示用户消息
-    addUserMessage(message, file?.name);
-
-    // 3. 显示加载动画
-    const loadingId = addLoadingMessage();
-
-    // 4. 发送请求
-    const formData = new FormData();
-    formData.append('message', message);
-    formData.append('session_id', state.currentSessionId);
-    if (file) formData.append('file', file);
-
-    // 5. 处理响应
-    const response = await fetch('/chat', {
-        method: 'POST',
-        body: formData
-    });
-
-    const data = await response.json();
-
-    // 6. 显示助手消息
-    removeLoadingMessage(loadingId);
-    addAssistantMessage(data);
-
-    // 7. 渲染图表
-    if (data.data_type === 'chart') {
-        renderChart(data.chart_data);
-    }
-
-    // 8. 更新会话列表
-    loadSessionList();
-}
-```
-
-### 图表渲染
-
-```javascript
-// 渲染排放因子曲线图
-function renderEmissionChart(chartData, chartId) {
-    const chart = echarts.init(document.getElementById(chartId));
-
-    const pollutants = Object.keys(chartData.pollutants);
-    const series = pollutants.map(p => ({
-        name: p,
-        data: chartData.pollutants[p].curve,
-        type: 'line',
-        smooth: true
-    }));
-
-    const option = {
-        xAxis: { name: '速度 (km/h)' },
-        yAxis: { name: '排放率 (g/km)' },
-        series: series,
-        legend: { data: pollutants },
-        tooltip: { trigger: 'axis' }
-    };
-
-    chart.setOption(option);
-}
-```
-
-### 数据显示修复
-
-**问题**: 追问时显示重复的历史数据
-
-**原因**: 后端读取了持久化的 `last_successful_result`
-
-**修复**:
 ```python
 # api/routes.py
 
-# 只读取当前 turn 的 Skill 执行结果
-if current_turn.skill_executions:
-    last_execution = current_turn.skill_executions[-1]
-    if last_execution.success:
-        # 构建图表数据
-        chart_data = build_emission_chart_data(...)
-
-# 没有执行 Skill，不显示图表
-else:
-    chart_data = None
-    table_data = None
+@router.post("/api/chat")
+async def chat(
+    message: str = Form(...),
+    session_id: str = Form(None),
+    file: UploadFile = File(None)
+):
+    if file:
+        # 保存文件: {session_id}_input{suffix}
+        suffix = Path(file.filename).suffix
+        input_file_path = TEMP_DIR / f"{session.session_id}_input{suffix}"
+        
+        with open(input_file_path, "wb") as f:
+            content = await file.read()
+            f.write(content)
+        
+        # 文件路径传给 Router
+        result = await session.chat(message, input_file_path)
 ```
 
-**前端防护**:
-```javascript
-// 验证数据有效性
-const hasValidChartData = data.data_type === 'chart' &&
-                         data.chart_data &&
-                         Object.keys(data.chart_data).length > 0;
+**优点**:
+- 简单: 每个会话只有一个输入文件
+- 自动清理: 新文件覆盖旧文件
 
-if (hasValidChartData) {
-    renderChart(data.chart_data);
+**缺点**:
+- 需要 mtime 检测来识别文件变化
+
+---
+
+## 工具系统
+
+### 工具定义
+
+系统提供 5 个工具，每个工具都遵循 OpenAI Function Calling 标准：
+
+```python
+# tools/definitions.py
+
+TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "query_emission_factors",
+            "description": "Query vehicle emission factor curves by speed. Returns chart and data table.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "vehicle_type": {
+                        "type": "string",
+                        "description": "Vehicle type (e.g., Passenger Car, Bus, Truck)"
+                    },
+                    "pollutant": {
+                        "type": "string",
+                        "description": "Pollutant name (e.g., CO2, NOx, PM2.5)"
+                    },
+                    "model_year": {
+                        "type": "integer",
+                        "description": "Model year (1995-2025)"
+                    },
+                    "season": {
+                        "type": "string",
+                        "enum": ["summer", "winter", "spring"],
+                        "description": "Season (default: summer)"
+                    }
+                },
+                "required": ["vehicle_type", "pollutant", "model_year"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "calculate_micro_emission",
+            "description": "Calculate emissions from second-by-second trajectory data using VSP method.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "file_path": {
+                        "type": "string",
+                        "description": "Path to trajectory data file"
+                    },
+                    "vehicle_type": {
+                        "type": "string",
+                        "description": "Vehicle type"
+                    },
+                    "model_year": {
+                        "type": "integer",
+                        "description": "Model year"
+                    },
+                    "pollutants": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "List of pollutants to calculate"
+                    }
+                },
+                "required": ["file_path", "vehicle_type", "model_year", "pollutants"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "calculate_macro_emission",
+            "description": "Calculate emissions for road network using fleet composition and traffic data.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "file_path": {
+                        "type": "string",
+                        "description": "Path to road network data file"
+                    },
+                    "model_year": {
+                        "type": "integer",
+                        "description": "Model year"
+                    },
+                    "pollutants": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "List of pollutants to calculate"
+                    }
+                },
+                "required": ["file_path", "model_year", "pollutants"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "analyze_file",
+            "description": "Analyze uploaded file structure and identify task type.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "file_path": {
+                        "type": "string",
+                        "description": "Path to file"
+                    }
+                },
+                "required": ["file_path"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "query_knowledge",
+            "description": "Search emission calculation knowledge base (reserved).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Search query"
+                    }
+                },
+                "required": ["query"]
+            }
+        }
+    }
+]
+```
+
+### 工具简化原则
+
+**优化前** (冗长的描述):
+```python
+{
+    "name": "query_emission_factors",
+    "description": """
+    Query vehicle emission factor curves from EPA MOVES database.
+    
+    Use this when:
+    - User wants to know emission factors for a specific vehicle type
+    - User asks about speed-emission relationships
+    - User needs emission factor data for calculations
+    
+    This tool will:
+    - Query MOVES database
+    - Interpolate emission factors by speed
+    - Return chart data and key speed points
+    """
 }
+```
+
+**优化后** (简洁的描述):
+```python
+{
+    "name": "query_emission_factors",
+    "description": "Query vehicle emission factor curves by speed. Returns chart and data table."
+}
+```
+
+**效果**:
+- 省 ~50 tokens/工具
+- 5 个工具共省 ~250 tokens/请求
+- LLM 更容易理解工具用途
+
+### 工具执行流程
+
+```
+LLM 返回工具调用
+    │
+    ▼
+Executor.execute(tool_name, arguments)
+    │
+    ├─> 1. 标准化参数
+    │   ├─ vehicle_type: "小汽车" → "Passenger Car"
+    │   ├─ pollutant: "二氧化碳" → "CO2"
+    │   └─ pollutants: ["二氧化碳", "氮氧化物"] → ["CO2", "NOx"]
+    │
+    ├─> 2. 获取工具实例
+    │   tool = ToolRegistry.get(tool_name)
+    │
+    ├─> 3. 调用工具
+    │   result = await tool.execute(**standardized_args)
+    │
+    └─> 4. 返回结果
+        return ToolResult(
+            success=True/False,
+            data={...},
+            summary="...",
+            download_file="..."  # 如有
+        )
 ```
 
 ---
 
-## 关键技术
+## 参数标准化
 
-### 1. VSP (Vehicle Specific Power) 计算
-
-用于微观排放计算，基于车辆运动状态计算瞬时功率。
+### 标准化器架构
 
 ```python
-def calculate_vsp(speed_kph: float, acceleration_mps2: float, grade_pct: float) -> float:
-    """
-    VSP = v * (1.1 * a + 9.81 * grade + 0.132) + 0.000302 * v^3
+# services/standardizer.py
 
-    单位:
-    - speed_kph: km/h
-    - acceleration_mps2: m/s²
-    - grade_pct: %
-    - 返回: kW/ton
-    """
-    v = speed_kph
-    a = acceleration_mps2
-    grade = grade_pct / 100  # 转换为小数
-
-    vsp = v * (1.1 * a + 9.81 * grade + 0.132) + 0.000302 * v**3
-    return vsp
-```
-
-### 2. MOVES Matrix 方法
-
-用于宏观排放计算，基于平均速度和车型查找排放率。
-
-```
-排放率 = f(车型, 年份, 污染物, 季节, 道路类型, 速度)
-
-通过多维插值从预计算矩阵中获取排放率。
-```
-
-### 3. LLM 参数标准化
-
-```python
-class VehicleStandardizer:
-    """车型标准化器"""
-
-    def __init__(self, llm_client):
-        self.llm = llm_client
-        self.cache = {}
-
-    def standardize(self, user_input: str) -> str:
-        """将用户输入标准化为 MOVES 标准车型"""
-
+class Standardizer:
+    """参数标准化器 - 支持 API 和本地模式"""
+    
+    def __init__(self):
+        self.mode = config.standardizer_mode  # "api" 或 "local"
+        self.cache = {}  # 缓存标准化结果
+        
+        if self.mode == "local":
+            self.client = LocalStandardizerClient()
+        else:
+            self.client = APIStandardizerClient()
+    
+    def standardize_vehicle(self, user_input: str) -> str:
+        """
+        标准化车型名称
+        
+        输入: "小汽车", "轿车", "passenger car", "sedan"
+        输出: "Passenger Car"
+        """
         # 检查缓存
         if user_input in self.cache:
             return self.cache[user_input]
-
-        # 构建 Prompt
-        prompt = f"""
-        将以下车型映射到 MOVES 标准车型之一:
-        {STANDARD_VEHICLE_TYPES}
-
-        用户输入: {user_input}
-
-        只返回标准车型名称。
+        
+        # 调用标准化服务
+        result = self.client.standardize(
+            task="vehicle_type",
+            input_value=user_input
+        )
+        
+        # 缓存结果
+        self.cache[user_input] = result
+        return result
+    
+    def standardize_pollutant(self, user_input: str) -> str:
         """
-
-        # 调用 LLM
-        response = self.llm.call(prompt)
-
-        # 解析结果
-        standard_type = self._parse_response(response)
-
-        # 缓存
-        self.cache[user_input] = standard_type
-
-        return standard_type
+        标准化污染物名称
+        
+        输入: "二氧化碳", "CO2", "carbon dioxide"
+        输出: "CO2"
+        """
+        if user_input in self.cache:
+            return self.cache[user_input]
+        
+        result = self.client.standardize(
+            task="pollutant",
+            input_value=user_input
+        )
+        
+        self.cache[user_input] = result
+        return result
 ```
 
-### 4. 上下文压缩
+### 标准映射表
 
 ```python
-def compress_context(context: Context) -> Context:
-    """压缩对话上下文"""
+# config/unified_mappings.yaml
 
-    # 策略1: 保留最近 N 轮
-    recent_turns = context.turns[-5:]
+vehicle_mappings:
+  # 中文别名
+  小汽车: Passenger Car
+  轿车: Passenger Car
+  私家车: Passenger Car
+  公交车: Bus
+  公交: Bus
+  巴士: Bus
+  货车: Truck
+  卡车: Truck
+  # 英文别名
+  passenger car: Passenger Car
+  sedan: Passenger Car
+  car: Passenger Car
+  bus: Bus
+  truck: Truck
+  # ... 更多映射
 
-    # 策略2: 保留所有 Skill 成功执行的结果
-    skill_results = [
-        turn for turn in context.turns
-        if any(exec.success for exec in turn.skill_executions)
-    ]
-
-    # 策略3: 早期对话摘要
-    summary = generate_summary(context.turns[:-10])
-
-    return Context(
-        turns=[summary_turn] + recent_turns,
-        session_id=context.session_id
-    )
+pollutant_mappings:
+  # 中文别名
+  二氧化碳: CO2
+  碳排放: CO2
+  氮氧化物: NOx
+  颗粒物: PM2.5
+  # 英文别名
+  carbon dioxide: CO2
+  nitrogen oxides: NOx
+  particulate matter: PM2.5
+  # ... 更多映射
 ```
 
-### 5. 文件处理
+### 标准化流程
+
+```
+用户输入: "小汽车"
+    │
+    ▼
+Standardizer.standardize_vehicle("小汽车")
+    │
+    ├─> 检查缓存
+    │   └─> 未命中
+    │
+    ├─> 调用标准化服务
+    │   │
+    │   ├─> API 模式: 调用 LLM API
+    │   │   Prompt: "将'小汽车'映射到 MOVES 标准车型"
+    │   │   Response: "Passenger Car"
+    │   │
+    │   └─> 本地模式: 调用本地 VLLM 服务
+    │       Request: {"model": "unified", "prompt": "[vehicle] 小汽车"}
+    │       Response: "Passenger Car"
+    │
+    ├─> 缓存结果
+    │   cache["小汽车"] = "Passenger Car"
+    │
+    └─> 返回: "Passenger Car"
+```
+
+### 集中化标准化
+
+**优化前**: 每个工具都有自己的标准化逻辑
 
 ```python
-class ExcelHandler:
-    """Excel 文件处理器"""
+# tools/macro_emission.py (旧代码)
 
-    def read_trajectory(self, file_path: str) -> pd.DataFrame:
-        """读取轨迹数据"""
+def _standardize_fleet_mix(self, fleet_mix: Dict) -> Dict:
+    """125 行的硬编码映射"""
+    result = {}
+    for raw_name, pct in fleet_mix.items():
+        if raw_name in ["小汽车", "轿车", "passenger car"]:
+            result["Passenger Car"] = pct
+        elif raw_name in ["公交车", "公交", "bus"]:
+            result["Bus"] = pct
+        # ... 重复 13 种车型的映射
+    return result
+```
 
-        # 1. 读取文件
-        df = pd.read_excel(file_path)
+**优化后**: 使用统一的标准化器
 
-        # 2. 智能列名映射
-        mapping = self._map_columns(df, task_type="micro_emission")
-        df = df.rename(columns=mapping)
+```python
+# tools/macro_emission.py (新代码)
 
-        # 3. 验证必需列
-        required = ["time", "speed"]
-        missing = [col for col in required if col not in df.columns]
-        if missing:
-            raise ValueError(f"缺少必需列: {missing}")
+def _standardize_fleet_mix(self, fleet_mix: Dict) -> Dict:
+    """24 行，使用统一标准化器"""
+    from services.standardizer import get_standardizer
+    standardizer = get_standardizer()
+    
+    result = {}
+    for raw_name, pct in fleet_mix.items():
+        std_name = standardizer.standardize_vehicle(str(raw_name))
+        if std_name and std_name in self.SUPPORTED_VEHICLES:
+            result[std_name] = result.get(std_name, 0) + pct
+    
+    return result if result else None
+```
 
-        # 4. 数据预处理
-        if "acceleration" not in df.columns:
-            df["acceleration"] = calculate_acceleration(df["speed"])
+**效果**:
+- 代码减少 ~100 行
+- 逻辑集中，易于维护
+- 自动享受标准化器的改进 (缓存、本地模型等)
 
-        if "grade" not in df.columns:
-            df["grade"] = 0.0
+---
 
-        return df
+## 关键技术细节
 
-    def _map_columns(self, df: pd.DataFrame, task_type: str) -> Dict:
-        """智能列名映射"""
-        # 尝试 LLM 映射
-        try:
-            mapping = map_columns_with_llm(df, task_type, self.llm)
-            return mapping["mapping"]
-        except Exception:
-            # 回退到硬编码
-            return self._fallback_mapping(df, task_type)
+### 动态提示词注入
+
+系统根据用户的任务类型动态调整提示词：
+
+```python
+# core/router.py
+
+def _build_system_prompt(self, file_context: Optional[Dict]) -> str:
+    """根据上下文动态构建提示词"""
+    
+    base_prompt = self.config.system_prompt
+    
+    if file_context:
+        task_type = file_context.get("file_task_type")
+        
+        if task_type == "micro_emission":
+            # 添加微观排放任务的特定指导
+            base_prompt += """
+
+For micro-scale emission calculation:
+1. Always request vehicle_type, model_year, and pollutants
+2. Vehicle type is required from file (do not assume)
+3. Suggest default pollutants: [CO2, NOx, CO, PM2.5, HC]
+4. Use calculate_micro_emission tool with file_path
+"""
+        
+        elif task_type == "macro_emission":
+            # 添加宏观排放任务的特定指导
+            base_prompt += """
+
+For macro-scale emission calculation:
+1. Extract fleet composition from file columns
+2. Default to 13 standard vehicle types if not specified
+3. Suggest default pollutants: [CO2, NOx, PM2.5]
+4. Use calculate_macro_emission tool with file_path
+"""
+    
+    return base_prompt
+```
+
+### 文件路径处理
+
+系统正确处理文件路径的多种场景：
+
+```python
+# core/router.py
+
+async def process(self, user_message: str, file_path: Optional[str] = None):
+    # 1. 接收 PathLike 对象
+    if file_path:
+        from pathlib import Path
+        import os
+        
+        # 2. 转换为字符串
+        file_path_str = str(file_path)
+        
+        # 3. 获取文件 mtime
+        current_mtime = os.path.getmtime(file_path_str)
+        
+        # 4. 保存到上下文 (字符串 + mtime)
+        file_context = {
+            "file_path": file_path_str,
+            "file_mtime": current_mtime,
+            # ...
+        }
+        
+        # 5. 传递给工具 (字符串)
+        result = await self.execute_tool(
+            tool_name="calculate_micro_emission",
+            arguments={"file_path": file_path_str, ...}
+        )
+```
+
+**关键点**:
+- `PathLike` → `str`: 确保路径可序列化
+- 记录 `mtime`: 用于缓存验证
+- 传递 `str`: 工具函数期望字符串路径
+
+### 工具结果摘要
+
+系统将工具执行结果转换为简洁的摘要，减少 token 消耗：
+
+```python
+# core/tool_executor.py
+
+def _summarize_result(self, result: ToolResult) -> str:
+    """将工具结果转换为简洁摘要"""
+    
+    if not result.success:
+        return f"Error: {result.summary}"
+    
+    if result.tool_name == "query_emission_factors":
+        return f"""
+Queried emission factors for {result.data['vehicle_type']} ({result.data['pollutant']}, {result.data['model_year']}):
+- Chart available: /static/emission_chart.png
+- Data available: /static/emission_data.csv
+- Key speeds: {list(result.data['emission_data'].keys())[:5]}...
+"""
+    
+    elif result.tool_name == "calculate_micro_emission":
+        return f"""
+Calculated micro-scale emissions:
+- Total CO2: {result.data['summary']['CO2']} kg
+- Trajectory points: {result.data['trajectory_points']}
+- Results: /static/micro_emission_results.csv
+"""
+    
+    # ... 其他工具的摘要
+    
+    return result.summary or "Tool executed successfully"
+```
+
+### 错误处理
+
+```python
+# core/tool_executor.py
+
+async def execute(self, tool_name: str, arguments: Dict) -> ToolResult:
+    try:
+        # 1. 获取工具
+        tool = ToolRegistry.get(tool_name)
+        if not tool:
+            return ToolResult(success=False, summary=f"Unknown tool: {tool_name}")
+        
+        # 2. 验证参数
+        validation = tool.validate(arguments)
+        if not validation.valid:
+            return ToolResult(success=False, summary=f"Invalid arguments: {validation.errors}")
+        
+        # 3. 执行工具
+        result = await tool.execute(**arguments)
+        
+        return result
+    
+    except FileNotFoundError as e:
+        return ToolResult(success=False, summary=f"File not found: {e}")
+    
+    except ValueError as e:
+        return ToolResult(success=False, summary=f"Invalid value: {e}")
+    
+    except Exception as e:
+        logger.error(f"Tool execution error: {e}", exc_info=True)
+        return ToolResult(success=False, summary=f"Execution error: {str(e)}")
 ```
 
 ---
 
 ## 性能优化
 
-### 缓存策略
+### Token 优化策略
 
-| 缓存类型 | 内容 | TTL | 位置 |
-|---------|------|-----|------|
-| 标准化缓存 | 车型/污染物映射 | 永久 | 内存 |
-| MOVES 缓存 | 排放因子查询结果 | 永久 | 内存 |
-| 会话缓存 | 对话历史 | 24h | 文件 |
-| LLM 缓存 | 相同输入的响应 | 1h | 内存 |
+1. **压缩系统提示词**: ~2000 → ~400 tokens (-80%)
+   - 移除冗余说明
+   - 使用格式化标记而非详细描述
+   - 集中重复指令
 
-### 异步处理
+2. **简化工具描述**: ~250 tokens/请求
+   - 每个工具描述从 ~100 → ~30 tokens
+   - 5 个工具共省 ~350 tokens/请求
+
+3. **使用结果摘要**: 减少 ~70-90%
+   - 微观排放: 280KB → ~200B (-99.9%)
+   - 宏观排放: 27MB → ~500B (-99.998%)
+
+4. **智能缓存**:
+   - 文件分析结果缓存 (带 mtime 验证)
+   - 参数标准化缓存 (车型、污染物)
+   - LLM API 响应缓存 (可选)
+
+### 并发处理
 
 ```python
-@router.post("/chat")
-async def chat(...):
-    """异步处理聊天请求"""
+# tools/macro_emission.py
 
-    # 异步保存文件
-    input_file_path = await save_file_async(file)
-
-    # 异步执行 Agent
-    reply = await asyncio.to_thread(
-        session.agent.chat,
-        message
-    )
-
-    return ChatResponse(reply=reply, ...)
+async def execute(self, file_path: str, model_year: int, pollutants: List[str]):
+    """并发计算多种污染物"""
+    
+    # 1. 读取文件 (一次)
+    df = pd.read_csv(file_path)
+    
+    # 2. 并发计算多种污染物
+    tasks = [
+        self._calculate_emission(df, model_year, pollutant)
+        for pollutant in pollutants
+    ]
+    
+    results = await asyncio.gather(*tasks)
+    
+    # 3. 合并结果
+    return self._merge_results(results)
 ```
 
----
+### 内存优化
 
-## 错误处理
+```python
+# core/memory_manager.py
 
-### 分层错误处理
-
-```
-┌─────────────────────────────────────────┐
-│ 前端错误处理                             │
-│ - 网络错误提示                           │
-│ - 文件验证                               │
-│ - 友好错误消息                           │
-└─────────────────────────────────────────┘
-           │
-           ▼
-┌─────────────────────────────────────────┐
-│ API 错误处理                             │
-│ - 请求验证                               │
-│ - 文件大小限制                           │
-│ - HTTP 异常                              │
-└─────────────────────────────────────────┘
-           │
-           ▼
-┌─────────────────────────────────────────┐
-│ Agent 错误处理                           │
-│ - 参数缺失 → 询问用户                    │
-│ - Skill 失败 → 重试/回退                 │
-│ - LLM 错误 → 使用缓存                    │
-└─────────────────────────────────────────┘
-           │
-           ▼
-┌─────────────────────────────────────────┐
-│ Skill 错误处理                           │
-│ - 数据验证失败 → 具体错误提示            │
-│ - 计算错误 → 返回部分结果                │
-│ - 文件错误 → 降级处理                    │
-└─────────────────────────────────────────┘
+class MemoryManager:
+    def __init__(self, max_tokens: int = 4000):
+        self.max_tokens = max_tokens
+        self.estimate_token = tiktoken.encoding_for_model("gpt-4")
+    
+    def _truncate_conversation(self, messages: List[Dict]) -> List[Dict]:
+        """截断对话以保持在 token 限制内"""
+        
+        current_tokens = sum(
+            len(self.estimate_token.encode(msg.get("content", "")))
+            for msg in messages
+        )
+        
+        if current_tokens <= self.max_tokens:
+            return messages
+        
+        # 保留系统提示词和最近的消息
+        system_messages = [m for m in messages if m.get("role") == "system"]
+        user_assistant_messages = [m for m in messages if m.get("role") in ["user", "assistant"]]
+        
+        # 从最新的消息开始保留
+        truncated = []
+        tokens = 0
+        
+        for msg in reversed(user_assistant_messages):
+            msg_tokens = len(self.estimate_token.encode(msg.get("content", "")))
+            if tokens + msg_tokens > self.max_tokens:
+                break
+            truncated.insert(0, msg)
+            tokens += msg_tokens
+        
+        return system_messages + truncated
 ```
 
 ---
 
 ## 部署架构
 
-### 开发环境
+### Railway 部署配置
 
-```
-uvicorn api.main:app --reload --host 0.0.0.0 --port 8000
+```yaml
+# railway.toml
+[build]
+builder = "NIXPACKS"
+
+[deploy]
+startCommand = "uvicorn api.app:app --host 0.0.0.0 --port $PORT"
+healthcheckPath = "/health"
+healthcheckTimeout = 300
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 10
+
+[deploy.env]
+PORT = "8000"
 ```
 
-### 生产环境
+### 环境变量
 
+```bash
+# 必需
+QWEN_API_KEY=xxx              # 通义千问 API Key
+STANDARDIZER_MODE=api         # api 或 local
+
+# 可选
+STANDARDIZER_API_BASE=xxx     # 标准化服务 API (api 模式)
+STANDARDIZER_LOCAL_URL=xxx    # 本地标准化服务 URL (local 模式)
+LOG_LEVEL=INFO                # 日志级别
+MAX_TOKENS=4000               # 最大上下文 tokens
 ```
-                    ┌─────────────────┐
-                    │   Nginx / CDN   │
-                    │   (静态文件)     │
-                    └─────────────────┘
-                             │
-                    ┌─────────────────┐
-                    │  Gunicorn +     │
-                    │  Uvicorn        │
-                    │  (多进程)       │
-                    └─────────────────┘
-                             │
-              ┌──────────────┼──────────────┐
-              │              │              │
-    ┌─────────────┐ ┌─────────────┐ ┌─────────────┐
-    │  Worker 1   │ │  Worker 2   │ │  Worker 3   │
-    └─────────────┘ └─────────────┘ └─────────────┘
-              │              │              │
-              └──────────────┼──────────────┘
-                             │
-                    ┌─────────────────┐
-                    │  Redis Cache    │
-                    └─────────────────┘
+
+### Docker 部署
+
+```dockerfile
+FROM python:3.11-slim
+
+WORKDIR /app
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY . .
+
+EXPOSE 8000
+
+CMD ["uvicorn", "api.app:app", "--host", "0.0.0.0", "--port", "8000"]
+```
+
+```yaml
+# docker-compose.yml
+version: '3.8'
+
+services:
+  emission-agent:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      - QWEN_API_KEY=${QWEN_API_KEY}
+      - STANDARDIZER_MODE=api
+    volumes:
+      - ./data:/app/data
+      - ./temp:/app/temp
 ```
 
 ---
 
-## 本地模型集成
+## 监控与调试
 
-### 架构设计
-
-系统支持两种标准化模式：
-
-1. **API模式** (默认)
-   - 调用云端LLM API (qwen-flash)
-   - 优点：无需本地资源、快速部署
-   - 缺点：有API调用成本、需要网络连接
-
-2. **本地模式** (可选)
-   - 使用本地微调的Qwen3-4B模型
-   - 通过VLLM服务提供高性能推理
-   - 优点：无API成本、更低延迟、数据隐私
-   - 缺点：需要GPU资源、需要模型训练
-
-### 本地模型架构
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│                    Windows (emission_agent)                  │
-│  ┌────────────────────────────────────────────────────────┐ │
-│  │  VehicleStandardizer / PollutantStandardizer           │ │
-│  │  └─> LocalStandardizerClient                           │ │
-│  │      ├─ 模式: VLLM                                     │ │
-│  │      ├─ 禁用代理访问本地服务                           │ │
-│  │      └─ 动态切换LoRA适配器                             │ │
-│  └────────────────────────────────────────────────────────┘ │
-│                                │                              │
-│                                │ HTTP (no proxy)              │
-│                                ↓                              │
-│                    ┌────────────────────────┐                 │
-│                    │   WSL2 Network Bridge  │                 │
-│                    │   172.20.x.x:8001      │                 │
-│                    └────────────────────────┘                 │
-└────────────────────────────────────────────────────────────────┘
-                                 │
-┌────────────────────────────────┼──────────────────────────────┐
-│                    WSL2 (Ubuntu)                               │
-│  ┌────────────────────────────┼────────────────────────────┐ │
-│  │  VLLM Service (port 8001)  │                            │ │
-│  │  ├─ Base: Qwen3-4B-Instruct-2507 (4B参数)             │ │
-│  │  ├─ LoRA: unified (车型+污染物, rank=16)               │ │
-│  │  └─ LoRA: column (列名映射, rank=32)                   │ │
-│  │                                                          │ │
-│  │  性能指标:                                               │ │
-│  │  - 首次延迟: ~100ms                                     │ │
-│  │  - 后续延迟: ~50ms                                      │ │
-│  │  - 显存占用: ~4GB                                       │ │
-│  │  - 并发支持: 高 (PagedAttention)                       │ │
-│  └────────────────────────────────────────────────────────┘ │
-└───────────────────────────────────────────────────────────────┘
-```
-
-### 技术栈
-
-| 组件 | 技术 | 说明 |
-|------|------|------|
-| 基础模型 | Qwen3-4B-Instruct-2507 | 4B参数，支持中英文 |
-| 微调方法 | LoRA (Low-Rank Adaptation) | 低秩适配，高效微调 |
-| 推理引擎 | VLLM 0.15.0 | 高性能推理服务器 |
-| 部署环境 | WSL2 + Ubuntu | Windows下的Linux子系统 |
-| 通信协议 | HTTP REST API | OpenAI兼容接口 |
-
-### LoRA适配器
-
-系统使用两个独立的LoRA适配器：
-
-1. **unified_lora** (rank=16)
-   - 任务：车型标准化 + 污染物标准化
-   - 训练数据：4,352条训练 + 512条验证
-   - 准确率目标：≥95%
-
-2. **column_lora** (rank=32)
-   - 任务：Excel列名映射
-   - 训练数据：2,550条训练 + 300条验证
-   - 准确率目标：≥90%
-
-### 配置管理
+### 日志系统
 
 ```python
-# config.py
+# utils/logger.py
 
-self.use_local_standardizer = os.getenv("USE_LOCAL_STANDARDIZER", "false").lower() == "true"
+import logging
+import sys
 
-self.local_standardizer_config = {
-    "enabled": self.use_local_standardizer,
-    "mode": os.getenv("LOCAL_STANDARDIZER_MODE", "direct"),  # "direct" or "vllm"
-    "base_model": os.getenv("LOCAL_STANDARDIZER_BASE_MODEL", "..."),
-    "unified_lora": os.getenv("LOCAL_STANDARDIZER_UNIFIED_LORA", "..."),
-    "column_lora": os.getenv("LOCAL_STANDARDIZER_COLUMN_LORA", "..."),
-    "device": os.getenv("LOCAL_STANDARDIZER_DEVICE", "cuda"),
-    "max_length": int(os.getenv("LOCAL_STANDARDIZER_MAX_LENGTH", "256")),
-    "vllm_url": os.getenv("LOCAL_STANDARDIZER_VLLM_URL", "http://172.20.x.x:8001"),
-}
+def setup_logger(name: str, level: str = "INFO") -> logging.Logger:
+    logger = logging.getLogger(name)
+    logger.setLevel(getattr(logging, level))
+    
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setFormatter(logging.Formatter(
+        '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    ))
+    
+    logger.addHandler(handler)
+    return logger
 ```
 
-### 关键技术细节
-
-#### 1. 代理配置处理
-
-**问题**: emission_agent配置了HTTP代理，导致无法连接本地VLLM服务。
-
-**解决方案**: 在`local_client.py`中禁用代理：
+### 关键日志点
 
 ```python
-response = requests.post(
-    f"{self.vllm_url}/v1/completions",
-    json={...},
-    proxies={"http": None, "https": None}  # 禁用代理
-)
+# core/router.py
+
+logger.info(f"Processing message: {user_message[:100]}...")
+logger.debug(f"File context: {file_context}")
+logger.info(f"LLM decision: {decision} (tools: {len(decision.tool_calls)})")
+logger.debug(f"Tool results: {results}")
+logger.info(f"Final response: {response[:100]}...")
 ```
 
-#### 2. WSL2网络配置
-
-**问题**: Windows无法通过`localhost`访问WSL2服务。
-
-**解决方案**: 使用WSL2的实际IP地址（如`172.20.251.164`）。
-
-```bash
-# 在WSL2中获取IP
-hostname -I | awk '{print $1}'
-```
-
-#### 3. LoRA适配器动态切换
-
-VLLM支持在同一服务中加载多个LoRA适配器，通过请求参数切换：
+### 调试模式
 
 ```python
-# 车型标准化
-response = requests.post(
-    f"{vllm_url}/v1/completions",
-    json={"model": "unified", "prompt": "[vehicle] 小汽车", ...}
-)
+# 启用调试日志
+import logging
+logging.basicConfig(level=logging.DEBUG)
 
-# 列名映射
-response = requests.post(
-    f"{vllm_url}/v1/completions",
-    json={"model": "column", "prompt": json.dumps(columns), ...}
-)
+# 查看完整的 LLM 请求/响应
+logger.debug(f"LLM request: {messages}")
+logger.debug(f"LLM response: {completion}")
 ```
-
-### 性能对比
-
-| 指标 | API模式 (qwen-flash) | 本地VLLM模式 (qwen3-4b) |
-|------|---------------------|------------------------|
-| 首次延迟 | ~500ms | ~100ms |
-| 后续延迟 | ~500ms | ~50ms |
-| 显存占用 | 0 | ~4GB |
-| 并发支持 | 高 | 高 |
-| 成本 | 按调用计费 | 免费 |
-| 数据隐私 | 云端 | 完全本地 |
-| 网络依赖 | 需要 | 不需要 |
-| 准确率 | 高 | 取决于训练质量 |
-
-### 数据收集与模型训练
-
-系统自动收集标准化数据用于模型训练：
-
-```python
-# llm/data_collector.py
-
-self._collector.log(
-    task="vehicle_type",
-    input_value=user_input,
-    output={"standard": result.standard, "confidence": result.confidence},
-    method=result.method,
-    model="local_qwen3-4b",  # 记录使用的模型
-    context=context
-)
-```
-
-收集的数据可用于：
-1. 评估模型性能
-2. 发现标准化错误
-3. 持续改进训练数据
-4. 微调模型参数
-
-### 部署流程
-
-1. **模型训练** (在WSL2中)
-   ```bash
-   cd ~/LOCAL_STANDARDIZER_MODEL
-   python scripts/04_train_lora.py --config configs/unified_lora_config.yaml
-   python scripts/04_train_lora.py --config configs/column_lora_config.yaml
-   ```
-
-2. **启动VLLM服务** (在WSL2中)
-   ```bash
-   vllm serve /path/to/base/model \
-       --enable-lora \
-       --lora-modules unified=/path/to/unified_lora \
-                      column=/path/to/column_lora \
-       --port 8001
-   ```
-
-3. **配置emission_agent** (在Windows中)
-   ```bash
-   # 编辑 .env
-   USE_LOCAL_STANDARDIZER=true
-   LOCAL_STANDARDIZER_MODE=vllm
-   LOCAL_STANDARDIZER_VLLM_URL=http://172.20.x.x:8001
-   ```
-
-4. **重启服务**
-   ```powershell
-   .\scripts\restart_server.ps1
-   ```
-
-### 故障排查
-
-常见问题及解决方案：
-
-1. **无法连接VLLM服务**
-   - 检查WSL2服务是否运行
-   - 确认IP地址是否正确
-   - 测试连接：`curl http://172.20.x.x:8001/health`
-
-2. **代理干扰**
-   - 确认`local_client.py`中已禁用代理
-   - 检查环境变量`HTTP_PROXY`
-
-3. **模型返回无效结果**
-   - 检查LoRA适配器是否正确加载
-   - 验证训练数据质量
-   - 查看VLLM服务日志
-
-详细部署指南请参考：[本地模型部署指南](本地模型部署指南.md)
-
----
-
-## 最近改进 (v1.2.0)
-
-### UI/UX 优化
-
-#### 1. ChatGPT风格界面设计
-
-**问题**：原界面缺乏视觉层次，消息区分不明显
-
-**解决方案**：
-```css
-/* 页面背景 */
-body {
-    background: #f7f7f8;  /* 浅灰背景 */
-}
-
-/* AI消息卡片 */
-.ai-message {
-    background: white;
-    border-radius: 12px;
-    padding: 16px;
-    box-shadow: 0 1px 2px rgba(0,0,0,0.05);
-}
-
-/* 用户消息气泡 */
-.user-message {
-    background: #10a37f;  /* 绿色气泡 */
-    color: white;
-}
-```
-
-**效果**：
-- 清晰的视觉层次
-- 更好的消息区分
-- 现代化的外观
-
-#### 2. 智能布局优化
-
-**问题**：滚动条不贴边，内容不居中，输入框不对齐
-
-**解决方案**：
-```css
-/* 消息容器 - 全宽，滚动条贴边 */
-#messages-container {
-    width: 100%;
-    padding: 0;
-}
-
-/* 消息包装器 - 内容居中 */
-#messages-container > div {
-    max-width: 52rem;
-    margin: 0 auto;
-    padding: 0 1rem;
-}
-
-/* 输入区域 - 与消息对齐 */
-#input-area .max-w-4xl {
-    max-width: 52rem;
-}
-```
-
-**效果**：
-- 滚动条贴右边缘
-- 内容居中显示（52rem宽度）
-- 输入框与消息完美对齐
-
-#### 3. 完整表格显示
-
-**问题**：表格只显示前5列，隐藏了排放结果列
-
-**修复前**：
-```python
-# api/routes.py (旧代码)
-preview_columns = list(df.columns)[:5]  # 只显示前5列
-table_data["columns"] = preview_columns
-```
-
-**修复后**：
-```python
-# api/routes.py (新代码)
-table_data["columns"] = list(df.columns)  # 显示所有列
-table_data["preview_rows"] = df.head(5).to_dict(orient="records")
-```
-
-**效果**：
-- 显示所有列（输入+车型分布+排放结果）
-- 用户可以看到完整的计算结果
-
-### Agent质量提升
-
-#### 1. 样本数据保留策略
-
-**问题**：LLM没有具体数据参考，回答质量差
-
-**修复前**：
-```python
-# agent/core.py (旧代码)
-if "results" in data:
-    filtered_data["results_count"] = len(data["results"])
-    # 不包含 data["results"] 本身
-```
-
-**修复后**：
-```python
-# agent/core.py (新代码)
-if "results" in data:
-    filtered_data["results_count"] = len(data["results"])
-    filtered_data["results_sample"] = data["results"][:5]  # 保留前5条样本
-```
-
-**效果**：
-- LLM有具体数据可以参考
-- 回答更准确、更具体
-- 避免发送过多数据（只保留5条样本）
-
-#### 2. 动态格式指导
-
-**问题**：文件输入和文字描述输入应该有不同的回答格式
-
-**解决方案**：
-```python
-# agent/core.py
-def _synthesize(self, query: str, understanding: str, results: Dict) -> str:
-    # 检查是否有input_file
-    has_input_file = self._check_has_input_file(results)
-
-    if has_input_file:
-        format_instruction = "前端会自动显示完整的表格预览。你的回答应该简洁。"
-    else:
-        format_instruction = "前端不会显示表格。你的回答应该包含完整的计算结果。"
-
-    prompt = SYNTHESIS_PROMPT + format_instruction
-    return self._synthesis_llm.chat(prompt)
-```
-
-**效果**：
-- 文件输入：简洁回答 + 表格预览
-- 文字描述：完整文本回答（无表格）
-
-#### 3. 智能回答格式切换
-
-**问题**：文字描述输入时显示"暂无数据"
-
-**解决方案**：
-```python
-# api/routes.py
-if has_input_file:
-    # 文件输入 -> 返回表格格式
-    data_type = "table"
-    table_data = {...}
-else:
-    # 文字描述输入 -> 纯文本格式
-    data_type = None  # 不返回表格数据
-```
-
-**效果**：
-- 根据输入方式自动选择合适的展示格式
-- 避免"暂无数据"的尴尬情况
-
-### 数据修复
-
-#### 1. 微观排放CSV表头修复
-
-**问题**：CSV文件表头有重复的`EmissionQuant`列名
-
-**原始表头**：
-```
-opModeID,pollutantID,SourceType,ModelYear,EmissionQuant,EmissionQuant
-```
-
-**数据结构**：
-- 第5列（第一个EmissionQuant）：年份值（2025, 2024...）
-- 第6列（第二个EmissionQuant）：排放因子值（0.00990433...）
-
-**问题原因**：
-- pandas读取时，第二个列被重命名为`EmissionQuant.1`
-- 代码读取`EmissionQuant`时，实际读到的是年份列
-- 结果：所有排放值都是2025
-
-**修复方案**：
-```bash
-# 统一三个CSV文件的表头
-opModeID,pollutantID,SourceType,ModelYear,CalendarYear,EmissionQuant
-```
-
-**修复文件**：
-- `atlanta_2025_1_55_65.csv` (冬季)
-- `atlanta_2025_4_75_65.csv` (春季)
-- `atlanta_2025_7_90_70.csv` (夏季)
-
-**效果**：
-- 排放值正确（不再是2025）
-- 三个季节数据格式统一
-- 从源头解决问题
-
-#### 2. 表格预览数据完整性
-
-**问题**：文字描述输入时没有表格预览数据
-
-**解决方案**：
-```python
-# api/routes.py
-if result_file_path and result_file_path.exists():
-    # 从Excel文件读取
-    df = pd.read_excel(result_file_path)
-    table_data["columns"] = list(df.columns)
-    table_data["preview_rows"] = df.head(5).to_dict(orient="records")
-else:
-    # 从results数组构建
-    results = skill_data.get("results", [])
-    if results:
-        table_data["columns"] = list(results[0].keys())
-        table_data["preview_rows"] = results[:5]
-```
-
-**效果**：
-- 文件输入和文字描述输入都能正确显示数据
-- 数据来源灵活（Excel文件或results数组）
-
-### 技术改进总结
-
-| 改进类别 | 具体改进 | 影响范围 |
-|---------|---------|---------|
-| UI/UX | ChatGPT风格界面 | 前端 (web/index.html) |
-| UI/UX | 智能布局优化 | 前端 (CSS) |
-| UI/UX | 完整表格显示 | 后端 (api/routes.py) |
-| Agent | 样本数据保留 | Agent层 (agent/core.py) |
-| Agent | 动态格式指导 | Agent层 (agent/core.py) |
-| Agent | 智能格式切换 | API层 (api/routes.py) |
-| 数据 | CSV表头修复 | 数据层 (skills/micro_emission/data/) |
-| 数据 | 表格预览完整性 | API层 (api/routes.py) |
 
 ---
 
 ## 总结
 
-Emission Agent 是一个完整的智能系统，展示了：
+### 核心设计原则
 
-1. **清晰的架构分层**: Agent-Skill 分离，职责明确
-2. **灵活的组件设计**: 可插拔的 Skill 系统
-3. **智能的数据处理**: LLM 辅助的参数标准化和列名映射
-4. **完善的对话管理**: 上下文压缩、多轮对话、状态保持
-5. **友好的用户界面**: ChatGPT风格Web界面、图表可视化、智能表格展示
-6. **本地模型支持**: 降低成本、提升性能、保护数据隐私
-7. **持续优化改进**: UI/UX优化、Agent质量提升、数据完整性修复
+1. **AI-First**: AI 模型负责决策，代码负责执行
+2. **最小化代码**: 只实现必要的逻辑，避免过度设计
+3. **Token 优化**: 压缩提示词，简化工具描述，使用结果摘要
+4. **智能缓存**: 文件分析缓存，参数标准化缓存
+5. **可扩展性**: 插件式工具系统，易于添加新功能
 
-系统的核心优势在于将复杂的领域计算封装在独立的 Skill 中，而 Agent 层保持轻量和通用，使得系统易于扩展和维护。通过本地模型集成，系统进一步提升了性能和数据安全性。v1.2.0版本的改进进一步提升了用户体验和系统可靠性。
+### 技术栈
+
+- **LLM**: 通义千问 (qwen-plus)
+- **框架**: FastAPI + Uvicorn
+- **数据处理**: Pandas + NumPy
+- **科学计算**: SciPy (插值)
+- **部署**: Railway / Docker
+
+### 项目结构
+
+```
+emission_agent/
+├── api/                    # API 层
+│   ├── routes.py          # SSE 聊天端点
+│   └── app.py             # FastAPI 应用
+├── core/                   # 核心逻辑
+│   ├── router.py          # AI 统一路由
+│   ├── assembler.py       # 上下文组装器
+│   ├── executor.py        # 工具执行器
+│   └── memory.py          # 记忆管理
+├── tools/                  # 工具实现
+│   ├── definitions.py     # 工具定义
+│   ├── registry.py        # 工具注册表
+│   ├── base.py            # 工具基类
+│   ├── micro_emission.py  # 微观排放
+│   ├── macro_emission.py  # 宏观排放
+│   ├── query_factors.py   # 因子查询
+│   ├── file_analyzer.py   # 文件分析
+│   └── knowledge.py       # 知识库
+├── services/               # 服务层
+│   └── standardizer.py    # 参数标准化
+├── models/                 # 数据模型
+│   └── schemas.py         # Pydantic 模型
+├── config/                 # 配置
+│   └── settings.py        # 配置管理
+├── utils/                  # 工具函数
+│   ├── logger.py          # 日志
+│   └── helpers.py         # 辅助函数
+└── docs/                   # 文档
+    └── ARCHITECTURE.md    # 架构文档 (本文档)
+```
+
+### 快速开始
+
+```bash
+# 1. 克隆项目
+git clone <repo>
+cd emission_agent
+
+# 2. 安装依赖
+pip install -r requirements.txt
+
+# 3. 配置环境变量
+export QWEN_API_KEY=your_api_key
+
+# 4. 启动服务
+uvicorn api.app:app --reload
+
+# 5. 访问 API
+curl http://localhost:8000/health
+```
+
+### 下一步
+
+- [ ] 添加更多工具 (图表生成、数据分析)
+- [ ] 实现 LLM 响应缓存
+- [ ] 添加用户认证
+- [ ] 实现多用户会话隔离
+- [ ] 添加前端 UI (Streamlit/React)
 
 ---
 
-**文档版本**: v1.2.0
-**最后更新**: 2026-02-03
-**维护者**: Emission Agent Team
+**文档版本**: 1.0  
+**最后更新**: 2025-02-23  
+**作者**: Claude Code
