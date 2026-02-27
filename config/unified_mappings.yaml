@@ -35,6 +35,10 @@ vehicle_types:
       - "滴滴"
       - "passenger car"
       - "car"
+      - "轻型汽油车"
+      - "汽油车"
+      - "乘用车"
+      - "轻型车"
     vsp_params:
       A: 0.156461
       B: 0.002001
