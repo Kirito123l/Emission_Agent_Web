@@ -11,15 +11,22 @@ RUN pip install --no-cache-dir --prefix=/install -r requirements.txt
 # ---- runtime stage: slim image without compilers ----
 FROM python:3.11-slim
 
-# Install git and gnupg (required for git-lfs)
+# Install git and ca-certificates
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends git curl gnupg && \
+    apt-get install -y --no-install-recommends git ca-certificates && \
     rm -rf /var/lib/apt/lists/*
 
-# Install git-lfs using official script
-RUN curl -s https://packagecloud.io/install/repositories/github/git-lfs/script.deb.sh | bash && \
-    apt-get install -y git-lfs && \
-    git lfs install
+# Install git-lfs directly from GitHub (no script dependency)
+RUN GIT_LFS_VERSION=3.5.1 && \
+    case "$(uname -m)" in \
+        x86_64) ARCH="amd64" ;; \
+        aarch64) ARCH="arm64" ;; \
+        *) echo "Unsupported architecture"; exit 1 ;; \
+    esac && \
+    curl -L "https://github.com/git-lfs/git-lfs/releases/download/v${GIT_LFS_VERSION}/git-lfs-linux-${ARCH}-v${GIT_LFS_VERSION}.tar.gz" -o /tmp/git-lfs.tar.gz && \
+    tar -xzf /tmp/git-lfs.tar.gz -C /tmp && \
+    /tmp/git-lfs-${GIT_LFS_VERSION}/install.sh && \
+    rm -rf /tmp/git-lfs*
 
 WORKDIR /app
 
