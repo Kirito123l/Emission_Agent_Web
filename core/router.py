@@ -326,7 +326,8 @@ class UnifiedRouter:
             tools_needing_rendering = [
                 "query_emission_factors",
                 "calculate_micro_emission",
-                "calculate_macro_emission"
+                "calculate_macro_emission",
+                "analyze_file"
             ]
 
             if only_result.get("success"):
@@ -503,6 +504,40 @@ class UnifiedRouter:
             lines.append(f"- 数据点数: {data_points}")
             if data_source:
                 lines.append(f"- 数据来源: {data_source}")
+
+            return "\n".join(lines)
+
+        if tool_name == "analyze_file":
+            data = result.get("data", {})
+            filename = data.get("filename", "未知文件")
+            row_count = data.get("row_count", 0)
+            columns = data.get("columns", [])
+            task_type = data.get("task_type", "未知")
+            confidence = data.get("confidence", 0)
+
+            lines = [
+                "## 文件分析结果",
+                "",
+                "**文件信息**",
+                f"- 文件名: {filename}",
+                f"- 数据行数: {row_count}",
+                f"- 识别类型: {task_type}",
+                f"- 置信度: {confidence:.0%}",
+                "",
+                "**数据列**",
+                f"- 列数: {len(columns)}",
+                f"- 列名: {', '.join(columns[:10])}",
+            ]
+            if len(columns) > 10:
+                lines.append(f"  (还有 {len(columns) - 10} 列...)")
+
+            # 检测到的任务类型提示
+            if task_type == "micro_emission":
+                lines.append("")
+                lines.append("**💡 建议**: 该文件适合用于微观排放计算（基于轨迹数据）")
+            elif task_type == "macro_emission":
+                lines.append("")
+                lines.append("**💡 建议**: 该文件适合用于宏观排放计算（基于路段流量）")
 
             return "\n".join(lines)
 
