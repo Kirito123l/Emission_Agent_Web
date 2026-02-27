@@ -29,3 +29,4 @@ RUN mkdir -p /app/data/sessions/history \
 EXPOSE 8000
 
 CMD ["uvicorn", "api.main:app", "--host", "0.0.0.0", "--port", "8000", "--log-level", "info"]
+# Last updated: Fri Feb 27 21:03:01 CST 2026
