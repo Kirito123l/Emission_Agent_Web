@@ -45,11 +45,21 @@ class ExcelHandler:
         "Combination Long-haul Truck",
     ]
 
+    AGGREGATE_TRUCK_KEY = "__TRUCK_TOTAL__"
+    TRUCK_DISTRIBUTION = {
+        "Passenger Truck": 20.0,
+        "Light Commercial Truck": 5.0,
+        "Combination Long-haul Truck": 2.0,
+    }
+
     VEHICLE_ALIASES = {
         "motorcycle": "Motorcycle",
         "摩托车": "Motorcycle",
         "passenger car": "Passenger Car",
         "car": "Passenger Car",
+        "taxi": "Passenger Car",
+        "出租车": "Passenger Car",
+        "网约车": "Passenger Car",
         "小汽车": "Passenger Car",
         "轿车": "Passenger Car",
         "乘用车": "Passenger Car",
@@ -77,10 +87,8 @@ class ExcelHandler:
         "combination short-haul truck": "Combination Short-haul Truck",
         "combination long-haul truck": "Combination Long-haul Truck",
         "heavy truck": "Combination Long-haul Truck",
-        "truck": "Combination Long-haul Truck",
         "重型货车": "Combination Long-haul Truck",
         "大货车": "Combination Long-haul Truck",
-        "货车": "Combination Long-haul Truck",
     }
 
     # 默认车队组成（与calculator.py保持一致）
@@ -345,14 +353,14 @@ class ExcelHandler:
         columns: List[str],
         ai_result: Dict[str, Any],
         used_columns: set,
-    ) -> Dict[str, str]:
+    ) -> Dict[str, List[str]]:
         # 先用AI映射结果
-        vehicle_columns: Dict[str, str] = {}
+        vehicle_columns: Dict[str, List[str]] = {}
         ai_fleet = ai_result.get("fleet_mapping", {})
         for col, vehicle in ai_fleet.items():
             if col in used_columns:
                 continue
-            vehicle_columns[vehicle] = col
+            vehicle_columns.setdefault(vehicle, []).append(col)
 
         if vehicle_columns:
             return vehicle_columns
@@ -363,7 +371,7 @@ class ExcelHandler:
                 continue
             standardized = self._standardize_vehicle_name(col)
             if standardized:
-                vehicle_columns[standardized] = col
+                vehicle_columns.setdefault(standardized, []).append(col)
                 continue
 
             # 对带百分号的列做一次弱语义识别
@@ -371,7 +379,7 @@ class ExcelHandler:
             if "%" in str(col) or "pct" in col_norm or "比例" in col_norm or "占比" in col_norm:
                 standardized = self._standardize_vehicle_name(col_norm.replace("%", ""))
                 if standardized:
-                    vehicle_columns[standardized] = col
+                    vehicle_columns.setdefault(standardized, []).append(col)
 
         return vehicle_columns
 
@@ -472,6 +480,10 @@ class ExcelHandler:
         norm = norm.replace("pct", "").replace("ratio", "").replace("share", "")
         norm = norm.strip("_ ")
 
+        # 通用“货车”列在城市道路表中通常表示货车总占比，按默认货车结构拆分
+        if norm in {"truck", "trucks", "货车", "卡车"}:
+            return self.AGGREGATE_TRUCK_KEY
+
         if name in self.STANDARD_VEHICLE_TYPES:
             return name
         if norm in self.VEHICLE_ALIASES:
@@ -494,7 +506,7 @@ class ExcelHandler:
             return best_std
         return None
 
-    def _parse_fleet_mix(self, row: pd.Series, vehicle_columns: Dict[str, str]) -> Optional[Dict[str, float]]:
+    def _parse_fleet_mix(self, row: pd.Series, vehicle_columns: Dict[str, List[str]]) -> Optional[Dict[str, float]]:
         """解析车型分布"""
         if not vehicle_columns:
             return None
@@ -502,17 +514,30 @@ class ExcelHandler:
         fleet_mix = {}
         total = 0.0
 
-        for standard_name, col_name in vehicle_columns.items():
-            value = row[col_name]
-            if pd.isna(value):
-                continue
-            try:
-                parsed = self._safe_float(value)
-            except Exception:
-                continue
-            if parsed > 0:
-                fleet_mix[standard_name] = parsed
-                total += parsed
+        for standard_name, col_names in vehicle_columns.items():
+            if isinstance(col_names, str):
+                col_names = [col_names]
+            aggregated_value = 0.0
+            for col_name in col_names:
+                value = row[col_name]
+                if pd.isna(value):
+                    continue
+                try:
+                    parsed = self._safe_float(value)
+                except Exception:
+                    continue
+                if parsed > 0:
+                    aggregated_value += parsed
+            if aggregated_value > 0:
+                fleet_mix[standard_name] = aggregated_value
+                total += aggregated_value
+
+        # “Truck%”等聚合列拆分到可计算的MOVES标准车型
+        truck_total = fleet_mix.pop(self.AGGREGATE_TRUCK_KEY, 0.0)
+        if truck_total > 0:
+            dist_total = sum(self.TRUCK_DISTRIBUTION.values())
+            for vehicle_type, ratio in self.TRUCK_DISTRIBUTION.items():
+                fleet_mix[vehicle_type] = fleet_mix.get(vehicle_type, 0.0) + truck_total * ratio / dist_total
 
         if not fleet_mix or total == 0:
             return None
@@ -528,7 +553,8 @@ class ExcelHandler:
         original_file_path: str,
         emission_results: List[Dict],
         pollutants: List[str],
-        output_dir: str
+        output_dir: str,
+        fleet_fill_info: Optional[Dict[str, Any]] = None
     ) -> Tuple[bool, Optional[str], Optional[str], Optional[str]]:
         """
         生成包含排放结果的增强版Excel文件（原始数据 + 排放列）
@@ -567,6 +593,57 @@ class ExcelHandler:
                 col_name = f"{pollutant}_kg_h"
                 df_original[col_name] = emission_values
 
+            # 2.1 对“整行车型占比为空”的路段，按实际计算使用的fleet mix回填原车型列
+            fill_rows = set((fleet_fill_info or {}).get("filled_row_indices", []))
+            if fill_rows:
+                fleet_columns = self._resolve_fleet_columns(
+                    columns=[str(c).strip() for c in df_original.columns],
+                    ai_result={"fleet_mapping": {}},
+                    used_columns=set(),
+                )
+                column_split = self._build_column_split(df_original, fleet_columns)
+
+                for idx in fill_rows:
+                    if idx < 0 or idx >= len(df_original) or idx >= len(emission_results):
+                        continue
+                    row_result = emission_results[idx]
+                    used_mix = row_result.get("fleet_composition", {})
+                    if not used_mix:
+                        continue
+                    vehicle_pct = {
+                        k: float(v.get("percentage", 0.0))
+                        for k, v in used_mix.items()
+                        if isinstance(v, dict)
+                    }
+
+                    for vehicle_key, cols in fleet_columns.items():
+                        if isinstance(cols, str):
+                            cols = [cols]
+                        if not cols:
+                            continue
+
+                        if vehicle_key == self.AGGREGATE_TRUCK_KEY:
+                            pct_total = (
+                                vehicle_pct.get("Passenger Truck", 0.0)
+                                + vehicle_pct.get("Light Commercial Truck", 0.0)
+                                + vehicle_pct.get("Combination Long-haul Truck", 0.0)
+                            )
+                        else:
+                            pct_total = vehicle_pct.get(vehicle_key, 0.0)
+
+                        if pct_total <= 0:
+                            continue
+
+                        splits = column_split.get(vehicle_key) or {}
+                        if not splits:
+                            equal = 1.0 / len(cols)
+                            splits = {c: equal for c in cols}
+
+                        for col in cols:
+                            value = pct_total * float(splits.get(col, 0.0))
+                            if pd.isna(df_original.at[idx, col]) or str(df_original.at[idx, col]).strip() == "":
+                                df_original.at[idx, col] = round(value, 4)
+
             # 3. 生成输出文件名
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             original_name = path.stem  # 不含扩展名的文件名
@@ -581,3 +658,37 @@ class ExcelHandler:
         except Exception as e:
             logger.exception("生成结果Excel失败")
             return False, None, None, f"生成结果文件失败: {str(e)}"
+
+    def _build_column_split(
+        self,
+        df: pd.DataFrame,
+        fleet_columns: Dict[str, List[str]],
+    ) -> Dict[str, Dict[str, float]]:
+        """
+        为同一车型对应多个列（如Car%+Taxi%）构建分配比例。
+        比例来自非空历史行均值；无有效样本时回退均分。
+        """
+        split: Dict[str, Dict[str, float]] = {}
+        for vehicle_name, cols in fleet_columns.items():
+            if isinstance(cols, str):
+                cols = [cols]
+            if not cols:
+                continue
+            if len(cols) == 1:
+                split[vehicle_name] = {cols[0]: 1.0}
+                continue
+
+            col_avgs: Dict[str, float] = {}
+            for col in cols:
+                numeric = pd.to_numeric(df[col], errors="coerce")
+                mean_val = float(numeric.mean()) if numeric.notna().any() else 0.0
+                col_avgs[col] = max(mean_val, 0.0)
+
+            total_avg = sum(col_avgs.values())
+            if total_avg <= 0:
+                equal = 1.0 / len(cols)
+                split[vehicle_name] = {c: equal for c in cols}
+            else:
+                split[vehicle_name] = {c: v / total_avg for c, v in col_avgs.items()}
+
+        return split

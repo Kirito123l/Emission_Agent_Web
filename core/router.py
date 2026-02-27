@@ -201,37 +201,6 @@ class UnifiedRouter:
             logger.info(f"Executing tool: {tool_call.name}")
             logger.debug(f"Tool arguments: {tool_call.arguments}")
 
-            # Simple rule: For micro emission calculation, require explicit vehicle type mention
-            if tool_call.name == "calculate_micro_emission":
-                vehicle_type = tool_call.arguments.get("vehicle_type")
-                if vehicle_type:
-                    # Check if user message contains vehicle-related keywords
-                    user_msg = context.messages[-1].get("content", "").lower()
-                    vehicle_keywords = [
-                        "小汽车", "轿车", "乘用车", "私家车", "sedan", "passenger car",
-                        "公交", "客车", "bus", "transit",
-                        "货车", "卡车", "truck", "cargo",
-                        "suv", "越野",
-                        "摩托", "motorcycle",
-                        "柴油车", "汽油车", "diesel", "gasoline"
-                    ]
-                    has_vehicle_mention = any(kw in user_msg for kw in vehicle_keywords)
-
-                    # Also check fact memory for recent vehicle
-                    recent_vehicle = self.memory.get_fact_memory().get("recent_vehicle")
-                    refers_to_previous = any(kw in user_msg for kw in ["同上", "沿用", "和之前", "还是", "一样"])
-
-                    if not has_vehicle_mention and not (recent_vehicle and refers_to_previous):
-                        logger.info(f"[Vehicle Check] No explicit vehicle mention found, asking for confirmation")
-                        return RouterResponse(
-                            text="请先告诉我车辆类型，例如：\n"
-                                 "- 小汽车（乘用车）\n"
-                                 "- 公交车\n"
-                                 "- 货车\n"
-                                 "- SUV\n"
-                                 "或者其他具体车型。"
-                        )
-
             result = await self.executor.execute(
                 tool_name=tool_call.name,
                 arguments=tool_call.arguments,

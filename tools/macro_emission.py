@@ -141,6 +141,47 @@ class MacroEmissionTool(BaseTool):
 
         return updated_links
 
+    def _fill_missing_link_fleet_mix(
+        self,
+        links_data: List[Dict],
+        fallback_fleet_mix: Dict,
+    ) -> Dict:
+        """
+        Fill links that still miss fleet_mix after all standardization.
+        Returns updated links and fill metadata for transparency/output export.
+        """
+        if not fallback_fleet_mix:
+            return {"links_data": links_data, "filled_count": 0, "filled_link_ids": [], "filled_row_indices": []}
+
+        updated_links: List[Dict] = []
+        filled_link_ids: List[str] = []
+        filled_row_indices: List[int] = []
+
+        for idx, link in enumerate(links_data):
+            new_link = dict(link)
+            link_mix = new_link.get("fleet_mix")
+            has_valid_mix = False
+            if isinstance(link_mix, dict):
+                for raw_value in link_mix.values():
+                    try:
+                        if float(raw_value) > 0:
+                            has_valid_mix = True
+                            break
+                    except Exception:
+                        continue
+            if not has_valid_mix:
+                new_link["fleet_mix"] = dict(fallback_fleet_mix)
+                filled_row_indices.append(idx)
+                filled_link_ids.append(str(new_link.get("link_id", f"Link_{idx + 1}")))
+            updated_links.append(new_link)
+
+        return {
+            "links_data": updated_links,
+            "filled_count": len(filled_row_indices),
+            "filled_link_ids": filled_link_ids,
+            "filled_row_indices": filled_row_indices,
+        }
+
     async def execute(self, **kwargs) -> ToolResult:
         """
         Execute macro emission calculation
@@ -205,13 +246,18 @@ class MacroEmissionTool(BaseTool):
             if default_fleet_mix:
                 default_fleet_mix = self._standardize_fleet_mix(default_fleet_mix) or default_fleet_mix
 
+            # 4.3 Fill per-link missing fleet_mix explicitly for deterministic behavior
+            effective_default_fleet_mix = default_fleet_mix or dict(self._calculator.DEFAULT_FLEET_MIX)
+            fill_info = self._fill_missing_link_fleet_mix(links_data, effective_default_fleet_mix)
+            links_data = fill_info["links_data"]
+
             # 5. Execute calculation
             result = self._calculator.calculate(
                 links_data=links_data,
                 pollutants=pollutants,
                 model_year=model_year,
                 season=season,
-                default_fleet_mix=default_fleet_mix
+                default_fleet_mix=effective_default_fleet_mix
             )
 
             # 6. Handle calculation errors
@@ -225,10 +271,20 @@ class MacroEmissionTool(BaseTool):
                             "pollutants": pollutants,
                             "model_year": model_year,
                             "season": season,
-                            "links_count": len(links_data)
+                            "links_count": len(links_data),
+                            "filled_fleet_mix_links": fill_info["filled_count"],
                         }
                     }
                 )
+
+            # Add fill metadata for frontend and synthesis transparency
+            result["data"]["fleet_mix_fill"] = {
+                "strategy": "default_fleet_mix",
+                "filled_count": fill_info["filled_count"],
+                "filled_link_ids": fill_info["filled_link_ids"],
+                "filled_row_indices": fill_info["filled_row_indices"],
+                "default_fleet_mix_used": effective_default_fleet_mix,
+            }
 
             # 7. Write output file (if specified)
             if output_file:
@@ -258,7 +314,8 @@ class MacroEmissionTool(BaseTool):
                         input_file,  # 添加原始文件路径作为第一个参数
                         results_data,
                         pollutants,
-                        outputs_dir
+                        outputs_dir,
+                        fleet_fill_info=result["data"].get("fleet_mix_fill"),
                     )
 
                     if success:
@@ -294,6 +351,10 @@ class MacroEmissionTool(BaseTool):
                     summary_parts.append(f"  - {pollutant}: {formatted}")
                 if all(float(v) == 0.0 for v in total_emissions.values()):
                     summary_parts.append("⚠️ 所有污染物结果为 0。请检查车型映射、污染物选择或输入参数是否有效。")
+
+            fill_count = result["data"].get("fleet_mix_fill", {}).get("filled_count", 0)
+            if fill_count > 0:
+                summary_parts.append(f"**缺失车型分布处理:** 已对 {fill_count} 个路段使用默认车队组成填补空白行")
 
             # Unit emission rates (average across all links)
             emission_rates = {}
