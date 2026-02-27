@@ -32,6 +32,9 @@ class FactMemory:
     recent_year: Optional[int] = None
     active_file: Optional[str] = None
     file_analysis: Optional[Dict] = None
+    last_tool_name: Optional[str] = None
+    last_tool_summary: Optional[str] = None
+    last_tool_snapshot: Optional[Dict] = None
     user_preferences: Dict = field(default_factory=dict)
 
 
@@ -88,6 +91,9 @@ class MemoryManager:
             "recent_year": self.fact_memory.recent_year,
             "active_file": self.fact_memory.active_file,
             "file_analysis": self.fact_memory.file_analysis,
+            "last_tool_name": self.fact_memory.last_tool_name,
+            "last_tool_summary": self.fact_memory.last_tool_summary,
+            "last_tool_snapshot": self.fact_memory.last_tool_snapshot,
         }
 
     def update(
@@ -147,26 +153,66 @@ class MemoryManager:
             if not result.get("success"):
                 continue
 
+            tool_name = call.get("name")
+            if tool_name:
+                self.fact_memory.last_tool_name = tool_name
+            if result.get("summary"):
+                self.fact_memory.last_tool_summary = str(result["summary"])
+
+            data = result.get("data", {})
+            if isinstance(data, dict):
+                # Keep a compact snapshot for follow-up grounding.
+                snapshot: Dict[str, Any] = {}
+                for k in ("query_info", "summary", "fleet_mix_fill", "download_file", "row_count", "columns", "task_type", "detected_type"):
+                    if k in data:
+                        snapshot[k] = data[k]
+                if snapshot:
+                    self.fact_memory.last_tool_snapshot = snapshot
+
             # Extract vehicle type
             if "vehicle_type" in args:
                 self.fact_memory.recent_vehicle = args["vehicle_type"]
+            elif isinstance(data, dict):
+                q = data.get("query_info", {})
+                if isinstance(q, dict) and q.get("vehicle_type"):
+                    self.fact_memory.recent_vehicle = q["vehicle_type"]
+                elif data.get("vehicle_type"):
+                    self.fact_memory.recent_vehicle = data["vehicle_type"]
 
             # Extract pollutant(s)
             if "pollutant" in args:
                 pol = args["pollutant"]
-                if pol not in self.fact_memory.recent_pollutants:
-                    self.fact_memory.recent_pollutants.insert(0, pol)
-                    self.fact_memory.recent_pollutants = self.fact_memory.recent_pollutants[:5]
+                self._merge_recent_pollutants([pol])
 
             if "pollutants" in args:
-                for pol in args["pollutants"]:
-                    if pol not in self.fact_memory.recent_pollutants:
-                        self.fact_memory.recent_pollutants.insert(0, pol)
-                self.fact_memory.recent_pollutants = self.fact_memory.recent_pollutants[:5]
+                if isinstance(args["pollutants"], list):
+                    self._merge_recent_pollutants(args["pollutants"])
+            elif isinstance(data, dict):
+                q = data.get("query_info", {})
+                if isinstance(q, dict) and isinstance(q.get("pollutants"), list):
+                    self._merge_recent_pollutants(q["pollutants"])
+                elif isinstance(data.get("pollutants"), list):
+                    self._merge_recent_pollutants(data["pollutants"])
 
             # Extract model year
             if "model_year" in args:
                 self.fact_memory.recent_year = args["model_year"]
+            elif isinstance(data, dict):
+                q = data.get("query_info", {})
+                if isinstance(q, dict) and q.get("model_year"):
+                    self.fact_memory.recent_year = q["model_year"]
+                elif data.get("model_year"):
+                    self.fact_memory.recent_year = data["model_year"]
+
+    def _merge_recent_pollutants(self, pollutants: List[Any]):
+        """Merge pollutant list while keeping recent distinct entries."""
+        for pol in pollutants:
+            if not pol:
+                continue
+            pol_str = str(pol)
+            if pol_str not in self.fact_memory.recent_pollutants:
+                self.fact_memory.recent_pollutants.insert(0, pol_str)
+        self.fact_memory.recent_pollutants = self.fact_memory.recent_pollutants[:5]
 
     def _detect_correction(self, user_message: str):
         """Detect user corrections and update fact memory"""
@@ -203,6 +249,10 @@ class MemoryManager:
     def clear_topic_memory(self):
         """Clear topic-related memory (when topic changes)"""
         self.fact_memory.active_file = None
+        self.fact_memory.file_analysis = None
+        self.fact_memory.last_tool_name = None
+        self.fact_memory.last_tool_summary = None
+        self.fact_memory.last_tool_snapshot = None
         logger.info("Cleared topic memory")
 
     def _save(self):
@@ -215,6 +265,9 @@ class MemoryManager:
                 "recent_year": self.fact_memory.recent_year,
                 "active_file": self.fact_memory.active_file,
                 "file_analysis": _convert_paths_to_strings(self.fact_memory.file_analysis),
+                "last_tool_name": self.fact_memory.last_tool_name,
+                "last_tool_summary": self.fact_memory.last_tool_summary,
+                "last_tool_snapshot": _convert_paths_to_strings(self.fact_memory.last_tool_snapshot),
             },
             "compressed_memory": self.compressed_memory,
             "working_memory": [
@@ -254,6 +307,9 @@ class MemoryManager:
                 self.fact_memory.recent_year = fm.get("recent_year")
                 self.fact_memory.active_file = fm.get("active_file")
                 self.fact_memory.file_analysis = fm.get("file_analysis")
+                self.fact_memory.last_tool_name = fm.get("last_tool_name")
+                self.fact_memory.last_tool_summary = fm.get("last_tool_summary")
+                self.fact_memory.last_tool_snapshot = fm.get("last_tool_snapshot")
 
             # Load compressed memory
             self.compressed_memory = data.get("compressed_memory", "")

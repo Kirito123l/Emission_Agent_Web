@@ -3,6 +3,7 @@ Context Assembler - Assembles context for LLM
 No decision-making, just information assembly
 """
 import logging
+import json
 from typing import Dict, List, Optional
 from dataclasses import dataclass
 from services.config_loader import ConfigLoader
@@ -133,6 +134,36 @@ class ContextAssembler:
 
         if fact_memory.get("active_file"):
             lines.append(f"Active file: {fact_memory['active_file']}")
+
+        file_analysis = fact_memory.get("file_analysis")
+        if isinstance(file_analysis, dict):
+            task_type = file_analysis.get("task_type") or file_analysis.get("detected_type")
+            if task_type:
+                lines.append(f"Cached file task_type: {task_type}")
+            if file_analysis.get("row_count") is not None:
+                lines.append(f"Cached file rows: {file_analysis.get('row_count')}")
+            cols = file_analysis.get("columns") or []
+            if isinstance(cols, list) and cols:
+                preview_cols = ", ".join([str(c) for c in cols[:12]])
+                if len(cols) > 12:
+                    preview_cols += f" ... (共{len(cols)}列)"
+                lines.append(f"Cached file columns: {preview_cols}")
+
+        if fact_memory.get("last_tool_name"):
+            lines.append(f"Last successful tool: {fact_memory['last_tool_name']}")
+        if fact_memory.get("last_tool_summary"):
+            summary = str(fact_memory["last_tool_summary"])
+            if len(summary) > 260:
+                summary = summary[:260] + "...(truncated)"
+            lines.append(f"Last tool summary: {summary}")
+        if fact_memory.get("last_tool_snapshot"):
+            try:
+                snap = json.dumps(fact_memory["last_tool_snapshot"], ensure_ascii=False)
+                if len(snap) > 360:
+                    snap = snap[:360] + "...(truncated)"
+                lines.append(f"Last tool snapshot: {snap}")
+            except Exception:
+                pass
 
         return "\n".join(lines) if lines else ""
 

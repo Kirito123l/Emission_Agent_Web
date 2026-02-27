@@ -5,7 +5,7 @@ Uses Tool Use mode, no planning layer
 import logging
 import json
 import re
-from typing import Dict, Optional
+from typing import Dict, Optional, List, Any
 from dataclasses import dataclass
 from core.assembler import ContextAssembler
 from core.executor import ToolExecutor
@@ -38,6 +38,7 @@ class RouterResponse:
     chart_data: Optional[Dict] = None
     table_data: Optional[Dict] = None
     download_file: Optional[str] = None
+    executed_tool_calls: Optional[List[Dict[str, Any]]] = None
 
 
 class UnifiedRouter:
@@ -149,15 +150,10 @@ class UnifiedRouter:
         )
 
         # 5. Update memory
-        tool_calls_data = None
-        if response.tool_calls:
-            tool_calls_data = [
-                {
-                    "name": tc.name,
-                    "arguments": tc.arguments
-                }
-                for tc in response.tool_calls
-            ]
+        tool_calls_data = result.executed_tool_calls
+        if tool_calls_data is None and response.tool_calls:
+            # Fallback: keep raw tool calls even if no execution result captured.
+            tool_calls_data = [{"name": tc.name, "arguments": tc.arguments} for tc in response.tool_calls]
 
         self.memory.update(
             user_message=user_message,
@@ -186,7 +182,7 @@ class UnifiedRouter:
         """
         # Case 1: Direct response (no tool calls)
         if not response.tool_calls:
-            return RouterResponse(text=response.content)
+            return RouterResponse(text=response.content, executed_tool_calls=None)
 
         # Case 2: Too many retries
         if tool_call_count >= self.MAX_TOOL_CALLS_PER_TURN:
@@ -214,6 +210,7 @@ class UnifiedRouter:
             tool_results.append({
                 "tool_call_id": tool_call.id,
                 "name": tool_call.name,
+                "arguments": tool_call.arguments,
                 "result": result
             })
 
@@ -283,7 +280,8 @@ class UnifiedRouter:
             text=synthesis_text,
             chart_data=chart_data,
             table_data=table_data,
-            download_file=download_file
+            download_file=download_file,
+            executed_tool_calls=self._build_memory_tool_calls(tool_results),
         )
 
     async def _analyze_file(self, file_path: str) -> Dict:
@@ -319,17 +317,15 @@ class UnifiedRouter:
             logger.info("[Synthesis] 检测到工具失败，使用确定性格式化结果")
             return self._format_results_as_fallback(tool_results)
 
-        # 单工具成功场景优先直接返回工具summary（最稳定）
+        # 单工具成功场景：优先使用工具summary，避免重复模板丢失关键信息
         if len(tool_results) == 1:
             only_result = tool_results[0].get("result", {})
-            only_name = tool_results[0].get("name")
-            if only_result.get("success") and only_result.get("summary") and only_name in [
-                "calculate_micro_emission",
-                "calculate_macro_emission",
-                "query_emission_factors",
-                "analyze_file",
-            ]:
+            only_name = tool_results[0].get("name", "unknown")
+            if only_result.get("success") and only_result.get("summary"):
                 logger.info(f"[Synthesis] 单工具成功({only_name})，直接返回工具summary")
+                return only_result["summary"]
+            if only_result.get("success"):
+                logger.info(f"[Synthesis] 单工具成功({only_name})，工具无summary，使用渲染回退")
                 return self._render_single_tool_success(only_name, only_result)
 
         # 1. 过滤数据，只保留关键信息
@@ -565,9 +561,10 @@ class UnifiedRouter:
             elif tool_name == "analyze_file":
                 filtered[tool_name] = {
                     "success": True,
-                    "file_type": data.get("detected_type"),
+                    "file_type": data.get("detected_type") or data.get("task_type"),
                     "columns": data.get("columns"),
-                    "row_count": data.get("row_count")
+                    "row_count": data.get("row_count"),
+                    "file_path": data.get("file_path"),
                 }
 
             # 其他工具
@@ -603,6 +600,45 @@ class UnifiedRouter:
                 error = r["result"].get("message") or r["result"].get("error") or "Unknown error"
                 summaries.append(f"[{r['name']}] Error: {error}")
         return "\n".join(summaries)
+
+    def _build_memory_tool_calls(self, tool_results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        Build compact tool-call records for memory extraction.
+        Keep tool success and compact data snapshot so follow-up turns stay grounded.
+        """
+        records: List[Dict[str, Any]] = []
+        for item in tool_results:
+            result = item.get("result", {})
+            records.append({
+                "name": item.get("name"),
+                "arguments": item.get("arguments", {}),
+                "result": {
+                    "success": bool(result.get("success")),
+                    "summary": result.get("summary"),
+                    "data": self._compact_tool_data(result.get("data")),
+                },
+            })
+        return records
+
+    def _compact_tool_data(self, data: Any) -> Optional[Dict[str, Any]]:
+        """Compact tool data to avoid storing large arrays in memory context."""
+        if not isinstance(data, dict):
+            return None
+
+        compact: Dict[str, Any] = {}
+        for key, value in data.items():
+            if key in {"results", "speed_curve", "pollutants"}:
+                continue
+            if isinstance(value, (str, int, float, bool)) or value is None:
+                compact[key] = value
+                continue
+            if key in {"query_info", "summary", "fleet_mix_fill", "download_file"} and isinstance(value, dict):
+                compact[key] = value
+                continue
+            if key == "columns" and isinstance(value, list):
+                compact[key] = value[:20]
+
+        return compact
 
     def _format_results_as_fallback(self, tool_results: list) -> str:
         """
