@@ -321,12 +321,24 @@ class UnifiedRouter:
         if len(tool_results) == 1:
             only_result = tool_results[0].get("result", {})
             only_name = tool_results[0].get("name", "unknown")
-            if only_result.get("success") and only_result.get("summary"):
-                logger.info(f"[Synthesis] 单工具成功({only_name})，直接返回工具summary")
-                return only_result["summary"]
+
+            # 对于需要友好渲染的工具，使用 _render_single_tool_success
+            tools_needing_rendering = [
+                "query_emission_factors",
+                "calculate_micro_emission",
+                "calculate_macro_emission"
+            ]
+
             if only_result.get("success"):
-                logger.info(f"[Synthesis] 单工具成功({only_name})，工具无summary，使用渲染回退")
-                return self._render_single_tool_success(only_name, only_result)
+                if only_name in tools_needing_rendering:
+                    logger.info(f"[Synthesis] 单工具成功({only_name})，使用友好渲染")
+                    return self._render_single_tool_success(only_name, only_result)
+                elif only_result.get("summary"):
+                    logger.info(f"[Synthesis] 单工具成功({only_name})，直接返回工具summary")
+                    return only_result["summary"]
+                else:
+                    logger.info(f"[Synthesis] 单工具成功({only_name})，工具无summary，使用渲染回退")
+                    return self._render_single_tool_success(only_name, only_result)
 
         # 1. 过滤数据，只保留关键信息
         filtered_results = self._filter_results_for_synthesis(tool_results)
